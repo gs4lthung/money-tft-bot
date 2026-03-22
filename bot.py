@@ -16,8 +16,8 @@ Setup:
 
 Notes:
 - Prefix command example:
-  !attack 16:20 "MAI HUONG DAY"
-  !attack 16:20 "MAI HUONG DAY" @SomeUser https://youtube.com/watch?v=abc123
+  !attack "MAI HUONG DAY"
+  !attack 16:20 "MAI HUONG DAY" https://youtube.com/watch?v=abc123
 - Slash command: /attack
 - The bot always uses local GIF file configured by DEFAULT_GIF_KEY.
 """
@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -100,6 +101,17 @@ def validate_attack_inputs(attack_time: str, attacker_name: str) -> None:
         raise AttackInputError("Attacker name cannot be empty.")
 
 
+def get_attack_time(attack_time: Optional[str]) -> str:
+    if attack_time is None or not attack_time.strip():
+        return datetime.now().strftime("%H:%M")
+
+    value = attack_time.strip()
+    if not TIME_REGEX.match(value):
+        raise AttackInputError("Invalid time format. Use HH:MM in 24-hour format (example: 16:20).")
+
+    return value
+
+
 def validate_attack_link(attack_link: Optional[str]) -> Optional[str]:
     if attack_link is None:
         return None
@@ -120,15 +132,12 @@ def build_attack_embed(
     attack_time: str,
     attacker_name: str,
     gif_file_path: Path,
-    target: Optional[discord.Member] = None,
     attack_link: Optional[str] = None,
 ) -> tuple[discord.Embed, discord.File]:
-    description = f"{attack_time} - {attacker_name} toàn quân chuẩn bị, đợi tín hiệu tổng tấn công! 💥"
-    if target is not None:
-        description += f"\nTarget: {target.mention}"
+    description = f"{attack_time} - {attacker_name} to�n qu�n chu?n b?, d?i t�n hi?u t?ng t?n c�ng! ??"
 
     embed = discord.Embed(
-        title="🚀 NPC MONEY TỔNG TIẾN CÔNG! 🚀",
+        title="?? NPC MONEY T?NG TI?N C�NG! ??",
         description=description,
         color=discord.Color.orange(),
         timestamp=datetime.now(timezone.utc),
@@ -142,7 +151,7 @@ def build_attack_embed(
     if attack_link:
         embed.add_field(name="Link", value=attack_link, inline=False)
 
-    embed.set_footer(text="Quỳ xuống dưới chân Ê Đê Tộc !!!")
+    embed.set_footer(text="Qu? xu?ng du?i ch�n � �� T?c !!!")
     return embed, local_file
 
 
@@ -176,80 +185,106 @@ async def on_ready() -> None:
 @bot.command(name="attack")
 async def attack_prefix(
     ctx: commands.Context,
-    attack_time: str,
-    attacker_name: str,
-    target: commands.Greedy[discord.Member],
-    attack_link: Optional[str] = None,
+    *,
+    raw_input: Optional[str] = None,
 ) -> None:
     """
     Prefix usage:
-    !attack <HH:MM> "<name>" [@target] [link]
+    !attack [HH:MM] "<name>" [link]
     """
     try:
+        if raw_input is None or not raw_input.strip():
+            raise AttackInputError("Missing arguments. Usage: !attack [HH:MM] \"<name>\" [link]")
+
+        tokens = shlex.split(raw_input)
+        if not tokens:
+            raise AttackInputError("Missing arguments. Usage: !attack [HH:MM] \"<name>\" [link]")
+
+        first_token = tokens[0]
+        if TIME_REGEX.match(first_token):
+            attack_time = get_attack_time(first_token)
+            tokens.pop(0)
+        else:
+            attack_time = get_attack_time(None)
+
+        attack_link = None
+        if tokens:
+            maybe_link = tokens[-1]
+            parsed = urlparse(maybe_link)
+            if parsed.scheme in {"http", "https"} and parsed.netloc:
+                attack_link = tokens.pop()
+
+        attacker_name = " ".join(tokens).strip()
         validate_attack_inputs(attack_time, attacker_name)
         validated_link = validate_attack_link(attack_link)
         gif_path = resolve_gif_path(DEFAULT_GIF_KEY)
-        selected_target = target[0] if target else None
         embed, local_file = build_attack_embed(
             ctx.author,
             attack_time,
             attacker_name,
             gif_path,
-            selected_target,
             validated_link,
         )
     except AttackInputError as exc:
-        await ctx.reply(f"❌ {exc}")
+        await ctx.reply(f"? {exc}")
         return
 
-    await ctx.send(embed=embed, file=local_file)
+    await ctx.send(
+        content="@everyone",
+        embed=embed,
+        file=local_file,
+        allowed_mentions=discord.AllowedMentions(everyone=True),
+    )
 
 
 @attack_prefix.error
 async def attack_prefix_error(ctx: commands.Context, error: commands.CommandError) -> None:
     if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.reply("❌ Missing arguments. Usage: !attack <HH:MM> \"<name>\" [@target] [link]")
+        await ctx.reply("? Missing arguments. Usage: !attack [HH:MM] \"<name>\" [link]")
         return
 
     if isinstance(error, commands.BadArgument):
-        await ctx.reply("❌ Invalid argument. Check time, name, optional @target mention, and optional link.")
+        await ctx.reply("? Invalid argument. Check optional time, name, and optional link.")
         return
 
     print(f"Unhandled prefix command error: {error}")
-    await ctx.reply("❌ Something went wrong while executing the attack command.")
+    await ctx.reply("? Something went wrong while executing the attack command.")
 
 
 @bot.tree.command(name="attack", description="Execute an attack with a local GIF")
 @app_commands.describe(
-    attack_time="Time in HH:MM format (24-hour), for example: 16:20",
     attacker_name="Displayed attacker name",
-    target="Optional target to mention",
+    attack_time="Optional time HH:MM (24-hour). Leave empty to use current time",
     attack_link="Optional URL (YouTube/Facebook/etc.)",
 )
 async def attack_slash(
     interaction: discord.Interaction,
-    attack_time: str,
     attacker_name: str,
-    target: Optional[discord.Member] = None,
+    attack_time: Optional[str] = None,
     attack_link: Optional[str] = None,
 ) -> None:
     try:
-        validate_attack_inputs(attack_time, attacker_name)
+        resolved_time = get_attack_time(attack_time)
+        validate_attack_inputs(resolved_time, attacker_name)
         validated_link = validate_attack_link(attack_link)
         gif_path = resolve_gif_path(DEFAULT_GIF_KEY)
         embed, local_file = build_attack_embed(
             interaction.user,
-            attack_time,
+            resolved_time,
             attacker_name,
             gif_path,
-            target,
             validated_link,
         )
     except AttackInputError as exc:
-        await interaction.response.send_message(f"❌ {exc}", ephemeral=True)
+        await interaction.response.send_message(f"? {exc}", ephemeral=True)
         return
 
-    await interaction.response.send_message(embed=embed, file=local_file)
+    await interaction.response.send_message(
+        content="@everyone",
+        embed=embed,
+        file=local_file,
+        allowed_mentions=discord.AllowedMentions(everyone=True),
+    )
 
 
 if __name__ == "__main__":

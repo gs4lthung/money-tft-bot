@@ -1,4 +1,4 @@
-"""
+﻿"""
 Discord.py local GIF attack bot (single file).
 
 Setup:
@@ -15,7 +15,7 @@ Setup:
    python bot.py
 
 Notes:
-- Prefix command example:
+- Prefix command examples:
   !attack "MAI HUONG DAY"
   !attack 16:20 "MAI HUONG DAY" https://youtube.com/watch?v=abc123
 - Slash command: /attack
@@ -45,7 +45,7 @@ GIF_KEY_MAP: dict[str, str] = {
 }
 DEFAULT_GIF_KEY = "money-tft"
 
-TIME_REGEX = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
+TIME_REGEX = re.compile(r"^(?:[01]\\d|2[0-3]):[0-5]\\d$")
 
 
 class AttackInputError(ValueError):
@@ -134,10 +134,10 @@ def build_attack_embed(
     gif_file_path: Path,
     attack_link: Optional[str] = None,
 ) -> tuple[discord.Embed, discord.File]:
-    description = f"{attack_time} - {attacker_name} to�n qu�n chu?n b?, d?i t�n hi?u t?ng t?n c�ng! ??"
+    description = f"{attack_time} - {attacker_name} toàn quân chuẩn bị, đợi tín hiệu tổng tấn công!"
 
     embed = discord.Embed(
-        title="?? NPC MONEY T?NG TI?N C�NG! ??",
+        title="NPC MONEY TỔNG TIẾN CÔNG!",
         description=description,
         color=discord.Color.orange(),
         timestamp=datetime.now(timezone.utc),
@@ -151,7 +151,7 @@ def build_attack_embed(
     if attack_link:
         embed.add_field(name="Link", value=attack_link, inline=False)
 
-    embed.set_footer(text="Qu? xu?ng du?i ch�n � �� T?c !!!")
+    embed.set_footer(text="Quỳ xuống dưới chân Ê Đê Tộc !!!")
     return embed, local_file
 
 
@@ -226,7 +226,7 @@ async def attack_prefix(
             validated_link,
         )
     except AttackInputError as exc:
-        await ctx.reply(f"? {exc}")
+        await ctx.reply(f"[x] {exc}")
         return
 
     await ctx.send(
@@ -240,15 +240,15 @@ async def attack_prefix(
 @attack_prefix.error
 async def attack_prefix_error(ctx: commands.Context, error: commands.CommandError) -> None:
     if isinstance(error, commands.MissingRequiredArgument):
-        await ctx.reply("? Missing arguments. Usage: !attack [HH:MM] \"<name>\" [link]")
+        await ctx.reply("[x] Missing arguments. Usage: !attack [HH:MM] \"<name>\" [link]")
         return
 
     if isinstance(error, commands.BadArgument):
-        await ctx.reply("? Invalid argument. Check optional time, name, and optional link.")
+        await ctx.reply("[x] Invalid argument. Check optional time, name, and optional link.")
         return
 
     print(f"Unhandled prefix command error: {error}")
-    await ctx.reply("? Something went wrong while executing the attack command.")
+    await ctx.reply("[x] Something went wrong while executing the attack command.")
 
 
 @bot.tree.command(name="attack", description="Execute an attack with a local GIF")
@@ -276,7 +276,7 @@ async def attack_slash(
             validated_link,
         )
     except AttackInputError as exc:
-        await interaction.response.send_message(f"? {exc}", ephemeral=True)
+        await interaction.response.send_message(f"[x] {exc}", ephemeral=True)
         return
 
     await interaction.response.send_message(

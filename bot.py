@@ -45,7 +45,7 @@ GIF_KEY_MAP: dict[str, str] = {
 }
 DEFAULT_GIF_KEY = "money-tft"
 
-TIME_REGEX = re.compile(r"^(?:[01]\\d|2[0-3]):[0-5]\\d$")
+TIME_REGEX = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 
 class AttackInputError(ValueError):

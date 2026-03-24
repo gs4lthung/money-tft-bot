@@ -709,6 +709,26 @@ def register_activity_feature(
 
         return scanned_total, added_total, skipped_channels
 
+    def has_any_all_time_activity(guild_id: int) -> bool:
+        with sqlite3.connect(activity_db_path) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM user_activity WHERE guild_id = ?",
+                (guild_id,),
+            ).fetchone()
+        return bool(row and int(row[0]) > 0)
+
+    async def bootstrap_all_time_activity_if_needed(guild: discord.Guild) -> tuple[bool, int, int, int]:
+        if has_any_all_time_activity(guild.id):
+            return False, 0, 0, 0
+
+        if export_scan_lock.locked():
+            return False, 0, 0, 0
+
+        async with export_scan_lock:
+            scanned_total, added_total, skipped_channels = await scan_full_guild_history(guild)
+            last_export_scan_at[guild.id] = datetime.now(timezone.utc)
+            return True, scanned_total, added_total, skipped_channels
+
     @bot.listen("on_ready")
     async def activity_on_ready() -> None:
         init_activity_db()
@@ -848,6 +868,14 @@ def register_activity_feature(
             channel_obj = ctx.guild.get_channel(selected_channel_id)
             channel_label = f"#{channel_obj.name}" if channel_obj is not None else f"channel:{selected_channel_id}"
 
+        if period == "all" and selected_channel_id is None:
+            bootstrapped, scanned_total, added_total, skipped_channels = await bootstrap_all_time_activity_if_needed(ctx.guild)
+            if bootstrapped:
+                await ctx.send(
+                    "No cached all-time activity found, so I scanned history first. "
+                    f"scanned={scanned_total}, added={added_total}, skipped_channels={skipped_channels}"
+                )
+
         view = InactiveMembersView(
             author_id=ctx.author.id,
             guild=ctx.guild,
@@ -965,10 +993,24 @@ def register_activity_feature(
             return
 
         selected_channel_id = channel.id if channel is not None else None
+
+        if period == "all" and selected_channel_id is None:
+            await interaction.response.defer(ephemeral=True, thinking=True)
+            bootstrapped, scanned_total, added_total, skipped_channels = await bootstrap_all_time_activity_if_needed(interaction.guild)
+            if bootstrapped:
+                await interaction.followup.send(
+                    "No cached all-time activity found, so I scanned history first. "
+                    f"scanned={scanned_total}, added={added_total}, skipped_channels={skipped_channels}",
+                    ephemeral=True,
+                )
+
         inactive = get_inactive_members(interaction.guild, period=period, channel_id=selected_channel_id)
 
         if not inactive:
-            await interaction.response.send_message("No inactive users found for this scope.", ephemeral=True)
+            if interaction.response.is_done():
+                await interaction.followup.send("No inactive users found for this scope.", ephemeral=True)
+            else:
+                await interaction.response.send_message("No inactive users found for this scope.", ephemeral=True)
             return
 
         channel_label = f"#{channel.name}" if channel is not None else "ALL CHANNELS"
@@ -980,11 +1022,18 @@ def register_activity_feature(
             period=period,
             channel_label=channel_label,
         )
-        await interaction.response.send_message(
-            embed=build_inactive_embed(inactive, 0, period, channel_label),
-            view=view,
-            ephemeral=True,
-        )
+        if interaction.response.is_done():
+            await interaction.followup.send(
+                embed=build_inactive_embed(inactive, 0, period, channel_label),
+                view=view,
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                embed=build_inactive_embed(inactive, 0, period, channel_label),
+                view=view,
+                ephemeral=True,
+            )
 
     @bot.tree.command(name="activity_export", description="Export activity report with fast incremental scan")
     async def activity_export_slash(

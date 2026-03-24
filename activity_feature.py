@@ -4,7 +4,7 @@ import asyncio
 import io
 import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal, Optional
 
@@ -413,6 +413,20 @@ def register_activity_feature(
         members.sort(key=lambda x: x[1].lower())
         return members
 
+    def format_vietnamese_datetime(raw_value: str) -> str:
+        value = (raw_value or "").strip()
+        if not value or value.lower() == "never":
+            return "chua co"
+
+        try:
+            dt = datetime.fromisoformat(value)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            vn_tz = timezone(timedelta(hours=7))
+            return dt.astimezone(vn_tz).strftime("%d/%m/%Y %H:%M")
+        except ValueError:
+            return value
+
     def build_member_activity_embed(
         members: list[tuple[int, str, int, int, int, str, str]],
         page_index: int,
@@ -444,9 +458,10 @@ def register_activity_feature(
             start=start + 1,
         ):
             marker = " [selected]" if selected_user_id == user_id else ""
+            last_active_vn = format_vietnamese_datetime(last_active)
             lines.append(
                 f"{idx}. <@{user_id}> ({username}) | role={role_name} | chat={chat_count} "
-                f"| last_active={last_active}{marker}"
+                f"| last_active={last_active_vn}{marker}"
             )
 
         filter_text = "INACTIVE ONLY" if show_inactive_only else "ALL MEMBERS"
@@ -536,10 +551,11 @@ def register_activity_feature(
                 start=start + 1,
             ):
                 numbered_label = f"{idx}. {username}"
+                last_active_vn = format_vietnamese_datetime(last_active)
                 options.append(
                     discord.SelectOption(
                         label=numbered_label[:100],
-                        description=f"role={role_name} | chat={chat_count} | last_active={last_active}"[:100],
+                        description=f"role={role_name} | chat={chat_count} | last_active={last_active_vn}"[:100],
                         value=str(user_id),
                         default=self.selected_user_id == user_id,
                     )

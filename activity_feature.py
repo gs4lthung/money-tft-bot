@@ -3,7 +3,6 @@ from __future__ import annotations
 import io
 import re
 import sqlite3
-from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
@@ -12,6 +11,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from openpyxl import Workbook
+from openpyxl.styles import Font
 
 
 CHANNEL_MENTION_REGEX = re.compile(r"^<#(\d+)>$")
@@ -257,14 +257,94 @@ def register_activity_feature(
 
         return [(str(r[0]), int(r[1]), int(r[2]), int(r[3]), str(r[4])) for r in rows]
 
-    def build_activity_excel(guild_id: int, period: str = "all", channel_id: Optional[int] = None) -> io.BytesIO:
-        rows = get_top_activity_rows(guild_id, 1000, period=period, metric="total", channel_id=channel_id)
+    def get_activity_rows_for_export(
+        guild_id: int,
+        period: str = "all",
+        channel_id: Optional[int] = None,
+    ) -> list[tuple[int, str, int, int, int, str]]:
+        with sqlite3.connect(activity_db_path) as conn:
+            if period == "all" and channel_id is None:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        user_id,
+                        username,
+                        chat_count,
+                        attack_count,
+                        (chat_count + attack_count) AS total_count,
+                        COALESCE(last_active, '')
+                    FROM user_activity
+                    WHERE guild_id = ?
+                    """,
+                    (guild_id,),
+                ).fetchall()
+            else:
+                start_iso = period_start_iso(period)
+                where_clauses = ["guild_id = ?"]
+                params: list[object] = [guild_id]
+
+                if channel_id is not None:
+                    where_clauses.append("channel_id = ?")
+                    params.append(channel_id)
+
+                if start_iso is not None:
+                    where_clauses.append("created_at >= ?")
+                    params.append(start_iso)
+
+                where_sql = " AND ".join(where_clauses)
+                rows = conn.execute(
+                    f"""
+                    SELECT
+                        user_id,
+                        username,
+                        COALESCE(SUM(CASE WHEN event_type = 'chat' THEN event_count ELSE 0 END), 0) AS chat_count,
+                        COALESCE(SUM(CASE WHEN event_type = 'attack' THEN event_count ELSE 0 END), 0) AS attack_count,
+                        COALESCE(SUM(event_count), 0) AS total_count,
+                        COALESCE(MAX(created_at), '') AS last_active
+                    FROM user_activity_events
+                    WHERE {where_sql}
+                    GROUP BY guild_id, user_id
+                    """,
+                    tuple(params),
+                ).fetchall()
+
+        return [(int(r[0]), str(r[1]), int(r[2]), int(r[3]), int(r[4]), str(r[5])) for r in rows]
+
+    def build_activity_excel(guild: discord.Guild, period: str = "all", channel_id: Optional[int] = None) -> io.BytesIO:
+        rows = get_activity_rows_for_export(guild.id, period=period, channel_id=channel_id)
+        by_user_id: dict[int, tuple[str, int, int, int, str]] = {}
+
+        for user_id, username, chat_count, attack_count, total_count, last_active in rows:
+            by_user_id[user_id] = (username, chat_count, attack_count, total_count, last_active)
+
+        for member in guild.members:
+            if member.bot:
+                continue
+            if member.id not in by_user_id:
+                by_user_id[member.id] = (str(member), 0, 0, 0, "")
+            else:
+                _, chat_count, attack_count, total_count, last_active = by_user_id[member.id]
+                by_user_id[member.id] = (str(member), chat_count, attack_count, total_count, last_active)
+
+        merged_rows = sorted(
+            by_user_id.values(),
+            key=lambda r: (-r[3], -r[1], -r[2], r[0].lower()),
+        )
+
         workbook = Workbook()
         sheet = workbook.active
         sheet.title = "Activity"
-        sheet.append(["Username", "Chat Count", "Attack Count", "Total", "Last Active (UTC)"])
-        for row in rows:
-            sheet.append(list(row))
+        sheet.append(["Username", "Chat Count", "Attack Count", "Total", "Last Active (UTC)", "Status"])
+
+        red_bold = Font(color="FFFF0000", bold=True)
+
+        for username, chat_count, attack_count, total_count, last_active in merged_rows:
+            status = "NO CHAT" if chat_count == 0 else ""
+            sheet.append([username, chat_count, attack_count, total_count, last_active, status])
+            if chat_count == 0:
+                row_index = sheet.max_row
+                for col in range(1, 7):
+                    sheet.cell(row=row_index, column=col).font = red_bold
 
         output = io.BytesIO()
         workbook.save(output)
@@ -405,7 +485,7 @@ def register_activity_feature(
             return
 
         try:
-            excel_bytes = build_activity_excel(ctx.guild.id, period=period_value, channel_id=selected_channel_id)
+            excel_bytes = build_activity_excel(ctx.guild, period=period_value, channel_id=selected_channel_id)
             channel_suffix = f"_ch{selected_channel_id}" if selected_channel_id is not None else "_allch"
             filename = (
                 f"activity_export_{period_value}{channel_suffix}_{ctx.guild.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
@@ -577,7 +657,7 @@ def register_activity_feature(
 
         try:
             selected_channel_id = channel.id if channel is not None else None
-            excel_bytes = build_activity_excel(interaction.guild_id, period=period, channel_id=selected_channel_id)
+            excel_bytes = build_activity_excel(interaction.guild, period=period, channel_id=selected_channel_id)
             channel_suffix = f"_ch{selected_channel_id}" if selected_channel_id is not None else "_allch"
             filename = (
                 f"activity_export_{period}{channel_suffix}_{interaction.guild_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"

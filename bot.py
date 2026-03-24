@@ -61,6 +61,7 @@ owner_user_id = int(owner_user_id_raw) if owner_user_id_raw.isdigit() else 0
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 

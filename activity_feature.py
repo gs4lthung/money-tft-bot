@@ -419,6 +419,7 @@ def register_activity_feature(
         selected_user_id: Optional[int] = None,
         show_inactive_only: bool = False,
         total_members: Optional[int] = None,
+        sort_label: str = "Name A-Z",
     ) -> discord.Embed:
         total = len(members)
         if total == 0:
@@ -443,8 +444,8 @@ def register_activity_feature(
             marker = " [selected]" if selected_user_id == user_id else ""
             inactive_tag = " | NO CHAT" if chat_count == 0 else ""
             lines.append(
-                f"{idx}. <@{user_id}> ({username}) | chat={chat_count} | attack={attack_count} "
-                f"| total={total_count_row} | last_active={last_active}{inactive_tag}{marker}"
+                f"{idx}. <@{user_id}> ({username}) | chat={chat_count} "
+                f"| last_active={last_active}{inactive_tag}{marker}"
             )
 
         filter_text = "INACTIVE ONLY" if show_inactive_only else "ALL MEMBERS"
@@ -459,7 +460,7 @@ def register_activity_feature(
         embed.set_footer(
             text=(
                 f"Page {safe_page + 1}/{total_pages} | Filter: {filter_text} | "
-                f"Showing {total}/{footer_total} | Inactive in view: {inactive_count}"
+                f"Sort: {sort_label} | Showing {total}/{footer_total} | Inactive in view: {inactive_count}"
             )
         )
         return embed
@@ -482,6 +483,11 @@ def register_activity_feature(
             self.page_index = 0
             self.selected_user_id: Optional[int] = None
             self.show_inactive_only = False
+            self._sort_modes: list[tuple[str, str]] = [
+                ("name_asc", "Name A-Z"),
+                ("chat_desc", "Chat High-Low"),
+            ]
+            self.sort_mode_index = 0
 
             self.select_user_menu = discord.ui.Select(
                 placeholder="Select a user",
@@ -494,13 +500,28 @@ def register_activity_feature(
             self.add_item(self.select_user_menu)
             self._refresh_components()
 
-        def _filtered_members(self) -> list[tuple[int, str, int, int, int, str]]:
-            if not self.show_inactive_only:
-                return self.members
-            return [row for row in self.members if row[2] == 0]
+        def _current_sort_mode(self) -> str:
+            return self._sort_modes[self.sort_mode_index][0]
+
+        def _current_sort_label(self) -> str:
+            return self._sort_modes[self.sort_mode_index][1]
+
+        def _visible_members(self) -> list[tuple[int, str, int, int, int, str]]:
+            if self.show_inactive_only:
+                filtered = [row for row in self.members if row[2] == 0]
+            else:
+                filtered = list(self.members)
+
+            sort_mode = self._current_sort_mode()
+            if sort_mode == "chat_desc":
+                filtered.sort(key=lambda row: (-row[2], row[1].lower()))
+            else:
+                filtered.sort(key=lambda row: row[1].lower())
+
+            return filtered
 
         def _refresh_components(self) -> None:
-            filtered_members = self._filtered_members()
+            filtered_members = self._visible_members()
             total_pages = max(1, (len(filtered_members) + inactive_page_size - 1) // inactive_page_size)
             safe_page = max(0, min(self.page_index, total_pages - 1))
             self.page_index = safe_page
@@ -541,6 +562,7 @@ def register_activity_feature(
             self.toggle_filter_button.style = (
                 discord.ButtonStyle.success if self.show_inactive_only else discord.ButtonStyle.primary
             )
+            self.sort_button.label = f"Sort: {self._current_sort_label()}"
 
         async def interaction_check(self, interaction: discord.Interaction) -> bool:
             if interaction.user.id != self.author_id:
@@ -552,7 +574,7 @@ def register_activity_feature(
             selected_value = self.select_user_menu.values[0]
             self.selected_user_id = None if selected_value == "0" else int(selected_value)
             self._refresh_components()
-            filtered_members = self._filtered_members()
+            filtered_members = self._visible_members()
             await interaction.response.edit_message(
                 embed=build_member_activity_embed(
                     filtered_members,
@@ -562,6 +584,7 @@ def register_activity_feature(
                     selected_user_id=self.selected_user_id,
                     show_inactive_only=self.show_inactive_only,
                     total_members=len(self.members),
+                    sort_label=self._current_sort_label(),
                 ),
                 view=self,
             )
@@ -570,7 +593,7 @@ def register_activity_feature(
         async def prev_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
             self.page_index = max(0, self.page_index - 1)
             self._refresh_components()
-            filtered_members = self._filtered_members()
+            filtered_members = self._visible_members()
             await interaction.response.edit_message(
                 embed=build_member_activity_embed(
                     filtered_members,
@@ -580,13 +603,14 @@ def register_activity_feature(
                     selected_user_id=self.selected_user_id,
                     show_inactive_only=self.show_inactive_only,
                     total_members=len(self.members),
+                    sort_label=self._current_sort_label(),
                 ),
                 view=self,
             )
 
         @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
         async def next_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-            filtered_members = self._filtered_members()
+            filtered_members = self._visible_members()
             total_pages = max(1, (len(filtered_members) + inactive_page_size - 1) // inactive_page_size)
             self.page_index = min(total_pages - 1, self.page_index + 1)
             self._refresh_components()
@@ -599,6 +623,28 @@ def register_activity_feature(
                     selected_user_id=self.selected_user_id,
                     show_inactive_only=self.show_inactive_only,
                     total_members=len(self.members),
+                    sort_label=self._current_sort_label(),
+                ),
+                view=self,
+            )
+
+        @discord.ui.button(label="Sort: Name A-Z", style=discord.ButtonStyle.secondary)
+        async def sort_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+            self.sort_mode_index = (self.sort_mode_index + 1) % len(self._sort_modes)
+            self.page_index = 0
+            self.selected_user_id = None
+            self._refresh_components()
+            filtered_members = self._visible_members()
+            await interaction.response.edit_message(
+                embed=build_member_activity_embed(
+                    filtered_members,
+                    self.page_index,
+                    self.period,
+                    self.channel_label,
+                    selected_user_id=self.selected_user_id,
+                    show_inactive_only=self.show_inactive_only,
+                    total_members=len(self.members),
+                    sort_label=self._current_sort_label(),
                 ),
                 view=self,
             )
@@ -609,7 +655,7 @@ def register_activity_feature(
             self.page_index = 0
             self.selected_user_id = None
             self._refresh_components()
-            filtered_members = self._filtered_members()
+            filtered_members = self._visible_members()
             await interaction.response.edit_message(
                 embed=build_member_activity_embed(
                     filtered_members,
@@ -619,6 +665,7 @@ def register_activity_feature(
                     selected_user_id=self.selected_user_id,
                     show_inactive_only=self.show_inactive_only,
                     total_members=len(self.members),
+                    sort_label=self._current_sort_label(),
                 ),
                 view=self,
             )
@@ -676,7 +723,7 @@ def register_activity_feature(
             self.members = [u for u in self.members if u[0] != self.selected_user_id]
             self.selected_user_id = None
             self._refresh_components()
-            filtered_members = self._filtered_members()
+            filtered_members = self._visible_members()
             await interaction.response.edit_message(
                 embed=build_member_activity_embed(
                     filtered_members,
@@ -685,6 +732,7 @@ def register_activity_feature(
                     self.channel_label,
                     show_inactive_only=self.show_inactive_only,
                     total_members=len(self.members),
+                    sort_label=self._current_sort_label(),
                 ),
                 view=self,
             )
@@ -694,6 +742,8 @@ def register_activity_feature(
             self.select_user_menu.disabled = True
             self.prev_button.disabled = True
             self.next_button.disabled = True
+            self.sort_button.disabled = True
+            self.toggle_filter_button.disabled = True
             self.kick_button.disabled = True
 
     async def scan_full_guild_history(guild: discord.Guild) -> tuple[int, int, int]:

@@ -379,6 +379,52 @@ def register_activity_feature(
         inactive.sort(key=lambda x: x[0].lower())
         return inactive
 
+    async def scan_full_guild_history(guild: discord.Guild) -> tuple[int, int, int]:
+        me = guild.me
+        if me is None:
+            return 0, 0, len(guild.text_channels)
+
+        scanned_total = 0
+        added_total = 0
+        skipped_channels = 0
+        batch: list[tuple[int, int, int, int, str, str]] = []
+        batch_size = 500
+
+        for channel in guild.text_channels:
+            perms = channel.permissions_for(me)
+            if not perms.read_messages or not perms.read_message_history:
+                skipped_channels += 1
+                continue
+
+            try:
+                async for msg in channel.history(limit=None):
+                    if msg.author.bot:
+                        continue
+
+                    scanned_total += 1
+                    batch.append(
+                        (
+                            guild.id,
+                            channel.id,
+                            msg.id,
+                            msg.author.id,
+                            str(msg.author),
+                            msg.created_at.astimezone(timezone.utc).isoformat(),
+                        )
+                    )
+
+                    if len(batch) >= batch_size:
+                        added_total += record_chat_events(batch)
+                        batch.clear()
+            except Exception:
+                skipped_channels += 1
+                logger.exception("Failed export scan for channel=%s guild=%s", channel.id, guild.id)
+
+        if batch:
+            added_total += record_chat_events(batch)
+
+        return scanned_total, added_total, skipped_channels
+
     @bot.listen("on_ready")
     async def activity_on_ready() -> None:
         init_activity_db()
@@ -534,7 +580,7 @@ def register_activity_feature(
         await ctx.send(embed=embed)
 
     @bot.command(name="activity_export")
-    async def activity_export_prefix(ctx: commands.Context, *args: str) -> None:
+    async def activity_export_prefix(ctx: commands.Context) -> None:
         if ctx.guild is None:
             await ctx.reply("[x] This command can only be used in a server.")
             return
@@ -547,123 +593,23 @@ def register_activity_feature(
             await ctx.reply("[x] DISCORD_OWNER_ID is not configured.")
             return
 
-        period_value = "all"
-        selected_channel_id: Optional[int] = None
-
-        for arg in args:
-            lowered = arg.lower().strip()
-            channel_match = CHANNEL_MENTION_REGEX.match(arg)
-            if channel_match:
-                selected_channel_id = int(channel_match.group(1))
-                continue
-
-            if lowered in period_values:
-                period_value = lowered
-                continue
-
-            await ctx.reply("[x] Invalid option. Use period (all/day/month) and optional #channel mention.")
-            return
+        await ctx.reply("Scanning all channels from all time before export. This may take a while...")
 
         try:
-            excel_bytes = build_activity_excel(ctx.guild, period=period_value, channel_id=selected_channel_id)
-            channel_suffix = f"_ch{selected_channel_id}" if selected_channel_id is not None else "_allch"
+            scanned_total, added_total, skipped_channels = await scan_full_guild_history(ctx.guild)
+            excel_bytes = build_activity_excel(ctx.guild, period="all", channel_id=None)
             filename = (
-                f"activity_export_{period_value}{channel_suffix}_{ctx.guild.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                f"activity_export_all_allch_{ctx.guild.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
             )
             await ctx.author.send(file=discord.File(excel_bytes, filename=filename))
-            await ctx.reply("I sent the activity Excel file to your DM.")
+            await ctx.send(
+                "I sent the activity Excel file to your DM. "
+                f"scan: scanned={scanned_total}, added={added_total}, "
+                f"ignored_duplicates={max(0, scanned_total - added_total)}, skipped_channels={skipped_channels}"
+            )
         except Exception:
             logger.exception("Failed to export activity for guild=%s", ctx.guild.id)
             await ctx.reply("[x] Failed to export activity file.")
-
-    @bot.command(name="activity_backfill")
-    async def activity_backfill_prefix(ctx: commands.Context, *args: str) -> None:
-        if ctx.guild is None:
-            await ctx.reply("[x] This command can only be used in a server.")
-            return
-
-        if owner_user_id == 0:
-            await ctx.reply("[x] DISCORD_OWNER_ID is not configured.")
-            return
-
-        if not is_owner_user(ctx.author.id):
-            await ctx.reply("[x] This backfill command is private and only available to the owner.")
-            return
-
-        requested_limit = 2000
-        selected_channel: Optional[discord.TextChannel] = None
-
-        for arg in args:
-            lowered = arg.lower().strip()
-            channel_match = CHANNEL_MENTION_REGEX.match(arg)
-            if channel_match:
-                channel_obj = ctx.guild.get_channel(int(channel_match.group(1)))
-                if isinstance(channel_obj, discord.TextChannel):
-                    selected_channel = channel_obj
-                    continue
-                await ctx.reply("[x] Channel must be a text channel in this server.")
-                return
-
-            if lowered.isdigit():
-                requested_limit = int(lowered)
-                continue
-
-            await ctx.reply("[x] Invalid option. Use optional #channel and optional limit (100-20000).")
-            return
-
-        per_channel_limit = max(100, min(20000, requested_limit))
-        channels: list[discord.TextChannel] = [selected_channel] if selected_channel is not None else list(ctx.guild.text_channels)
-
-        me = ctx.guild.me
-        if me is None:
-            await ctx.reply("[x] Could not resolve bot member permissions.")
-            return
-
-        await ctx.reply(
-            f"Starting backfill. Scope={'1 channel' if selected_channel else 'all text channels'}, "
-            f"limit={per_channel_limit} per channel."
-        )
-
-        scanned_total = 0
-        added_total = 0
-        batch: list[tuple[int, int, int, int, str, str]] = []
-        batch_size = 500
-
-        for channel in channels:
-            perms = channel.permissions_for(me)
-            if not perms.read_messages or not perms.read_message_history:
-                continue
-
-            try:
-                async for msg in channel.history(limit=per_channel_limit):
-                    if msg.author.bot:
-                        continue
-
-                    scanned_total += 1
-                    batch.append(
-                        (
-                            ctx.guild.id,
-                            channel.id,
-                            msg.id,
-                            msg.author.id,
-                            str(msg.author),
-                            msg.created_at.astimezone(timezone.utc).isoformat(),
-                        )
-                    )
-
-                    if len(batch) >= batch_size:
-                        added_total += record_chat_events(batch)
-                        batch.clear()
-            except Exception:
-                logger.exception("Failed backfill read for channel=%s guild=%s", channel.id, ctx.guild.id)
-
-        if batch:
-            added_total += record_chat_events(batch)
-
-        await ctx.send(
-            f"Backfill complete. scanned={scanned_total}, added={added_total}, "
-            f"ignored_duplicates={max(0, scanned_total - added_total)}"
-        )
 
     @bot.tree.command(name="activity_top", description="Show top active users in this server")
     @app_commands.describe(
@@ -747,17 +693,11 @@ def register_activity_feature(
         )
         await interaction.response.send_message(embed=embed)
 
-    @bot.tree.command(name="activity_export", description="Export activity report to Excel (owner only)")
-    @app_commands.describe(
-        period="Time range for export: all time, today, or this month",
-        channel="Optional channel filter; default is all channels",
-    )
+    @bot.tree.command(name="activity_export", description="Scan all channels (all time) and export activity report")
     async def activity_export_slash(
         interaction: discord.Interaction,
-        period: Literal["all", "day", "month"] = "all",
-        channel: Optional[discord.TextChannel] = None,
     ) -> None:
-        if interaction.guild_id is None:
+        if interaction.guild is None:
             await interaction.response.send_message("[x] This command can only be used in a server.", ephemeral=True)
             return
 
@@ -773,14 +713,17 @@ def register_activity_feature(
             return
 
         try:
-            selected_channel_id = channel.id if channel is not None else None
-            excel_bytes = build_activity_excel(interaction.guild, period=period, channel_id=selected_channel_id)
-            channel_suffix = f"_ch{selected_channel_id}" if selected_channel_id is not None else "_allch"
+            await interaction.response.defer(ephemeral=True, thinking=True)
+
+            scanned_total, added_total, skipped_channels = await scan_full_guild_history(interaction.guild)
+            excel_bytes = build_activity_excel(interaction.guild, period="all", channel_id=None)
             filename = (
-                f"activity_export_{period}{channel_suffix}_{interaction.guild_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                f"activity_export_all_allch_{interaction.guild_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
             )
-            await interaction.response.send_message(
-                f"Activity report generated for {period}.",
+            await interaction.followup.send(
+                "Activity report generated after full scan. "
+                f"scanned={scanned_total}, added={added_total}, "
+                f"ignored_duplicates={max(0, scanned_total - added_total)}, skipped_channels={skipped_channels}",
                 file=discord.File(excel_bytes, filename=filename),
                 ephemeral=True,
             )
@@ -790,80 +733,3 @@ def register_activity_feature(
                 await interaction.followup.send("[x] Failed to export activity file.", ephemeral=True)
             else:
                 await interaction.response.send_message("[x] Failed to export activity file.", ephemeral=True)
-
-    @bot.tree.command(name="activity_backfill", description="Backfill past chat messages into activity stats (owner only)")
-    @app_commands.describe(
-        limit="How many recent messages to scan per channel (100-20000)",
-        channel="Optional channel to backfill; default scans all text channels",
-    )
-    async def activity_backfill_slash(
-        interaction: discord.Interaction,
-        limit: app_commands.Range[int, 100, 20000] = 2000,
-        channel: Optional[discord.TextChannel] = None,
-    ) -> None:
-        if interaction.guild is None:
-            await interaction.response.send_message("[x] This command can only be used in a server.", ephemeral=True)
-            return
-
-        if owner_user_id == 0:
-            await interaction.response.send_message("[x] DISCORD_OWNER_ID is not configured.", ephemeral=True)
-            return
-
-        if not is_owner_user(interaction.user.id):
-            await interaction.response.send_message(
-                "[x] This backfill command is private and only available to the owner.",
-                ephemeral=True,
-            )
-            return
-
-        guild = interaction.guild
-        me = guild.me
-        if me is None:
-            await interaction.response.send_message("[x] Could not resolve bot member permissions.", ephemeral=True)
-            return
-
-        await interaction.response.defer(ephemeral=True, thinking=True)
-
-        channels: list[discord.TextChannel] = [channel] if channel is not None else list(guild.text_channels)
-        per_channel_limit = int(limit)
-        scanned_total = 0
-        added_total = 0
-        batch: list[tuple[int, int, int, int, str, str]] = []
-        batch_size = 500
-
-        for text_channel in channels:
-            perms = text_channel.permissions_for(me)
-            if not perms.read_messages or not perms.read_message_history:
-                continue
-
-            try:
-                async for msg in text_channel.history(limit=per_channel_limit):
-                    if msg.author.bot:
-                        continue
-
-                    scanned_total += 1
-                    batch.append(
-                        (
-                            guild.id,
-                            text_channel.id,
-                            msg.id,
-                            msg.author.id,
-                            str(msg.author),
-                            msg.created_at.astimezone(timezone.utc).isoformat(),
-                        )
-                    )
-
-                    if len(batch) >= batch_size:
-                        added_total += record_chat_events(batch)
-                        batch.clear()
-            except Exception:
-                logger.exception("Failed slash backfill read for channel=%s guild=%s", text_channel.id, guild.id)
-
-        if batch:
-            added_total += record_chat_events(batch)
-
-        await interaction.followup.send(
-            f"Backfill complete. scanned={scanned_total}, added={added_total}, "
-            f"ignored_duplicates={max(0, scanned_total - added_total)}",
-            ephemeral=True,
-        )

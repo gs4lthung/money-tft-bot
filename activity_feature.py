@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import re
 import sqlite3
+from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal, Optional
@@ -48,6 +49,18 @@ def register_activity_feature(
                     username TEXT NOT NULL,
                     event_type TEXT NOT NULL,
                     event_count INTEGER NOT NULL,
+                    created_at TEXT NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS processed_messages (
+                    message_id INTEGER PRIMARY KEY,
+                    guild_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    username TEXT NOT NULL,
                     created_at TEXT NOT NULL
                 )
                 """
@@ -106,6 +119,67 @@ def register_activity_feature(
                 )
 
             conn.commit()
+
+    def record_chat_events(
+        events: list[tuple[int, int, int, int, str, str]],
+    ) -> int:
+        if not events:
+            return 0
+
+        # Aggregate unseen messages to keep DB writes small and avoid double counting.
+        aggregated: dict[tuple[int, int, int], tuple[str, int, str]] = {}
+        inserted_messages = 0
+
+        with sqlite3.connect(activity_db_path) as conn:
+            for guild_id, channel_id, message_id, user_id, username, created_at in events:
+                cursor = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO processed_messages
+                    (message_id, guild_id, channel_id, user_id, username, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (message_id, guild_id, channel_id, user_id, username, created_at),
+                )
+                if cursor.rowcount == 0:
+                    continue
+
+                inserted_messages += 1
+                key = (guild_id, channel_id, user_id)
+                existing = aggregated.get(key)
+                if existing is None:
+                    aggregated[key] = (username, 1, created_at)
+                    continue
+
+                existing_username, existing_count, existing_last_active = existing
+                latest_active = created_at if created_at > existing_last_active else existing_last_active
+                latest_username = username if created_at >= existing_last_active else existing_username
+                aggregated[key] = (latest_username, existing_count + 1, latest_active)
+
+            for (guild_id, channel_id, user_id), (username, chat_increment, last_active) in aggregated.items():
+                conn.execute(
+                    """
+                    INSERT INTO user_activity (guild_id, user_id, username, chat_count, attack_count, last_active)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                        username = excluded.username,
+                        chat_count = user_activity.chat_count + excluded.chat_count,
+                        attack_count = user_activity.attack_count + excluded.attack_count,
+                        last_active = excluded.last_active
+                    """,
+                    (guild_id, user_id, username, chat_increment, 0, last_active),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO user_activity_events
+                    (guild_id, channel_id, user_id, username, event_type, event_count, created_at)
+                    VALUES (?, ?, ?, ?, 'chat', ?, ?)
+                    """,
+                    (guild_id, channel_id, user_id, username, chat_increment, last_active),
+                )
+
+            conn.commit()
+
+        return inserted_messages
 
     def period_start_iso(period: str) -> Optional[str]:
         now = datetime.now(timezone.utc)
@@ -208,12 +282,17 @@ def register_activity_feature(
 
         if message.guild is not None:
             try:
-                record_activity(
-                    guild_id=message.guild.id,
-                    channel_id=message.channel.id,
-                    user_id=message.author.id,
-                    username=str(message.author),
-                    chat_increment=1,
+                record_chat_events(
+                    [
+                        (
+                            message.guild.id,
+                            message.channel.id,
+                            message.id,
+                            message.author.id,
+                            str(message.author),
+                            message.created_at.astimezone(timezone.utc).isoformat(),
+                        )
+                    ]
                 )
             except Exception:
                 logger.exception("Failed to record chat activity for user=%s", message.author.id)
@@ -337,6 +416,95 @@ def register_activity_feature(
             logger.exception("Failed to export activity for guild=%s", ctx.guild.id)
             await ctx.reply("[x] Failed to export activity file.")
 
+    @bot.command(name="activity_backfill")
+    async def activity_backfill_prefix(ctx: commands.Context, *args: str) -> None:
+        if ctx.guild is None:
+            await ctx.reply("[x] This command can only be used in a server.")
+            return
+
+        if owner_user_id == 0:
+            await ctx.reply("[x] DISCORD_OWNER_ID is not configured.")
+            return
+
+        if not is_owner_user(ctx.author.id):
+            await ctx.reply("[x] This backfill command is private and only available to the owner.")
+            return
+
+        requested_limit = 2000
+        selected_channel: Optional[discord.TextChannel] = None
+
+        for arg in args:
+            lowered = arg.lower().strip()
+            channel_match = CHANNEL_MENTION_REGEX.match(arg)
+            if channel_match:
+                channel_obj = ctx.guild.get_channel(int(channel_match.group(1)))
+                if isinstance(channel_obj, discord.TextChannel):
+                    selected_channel = channel_obj
+                    continue
+                await ctx.reply("[x] Channel must be a text channel in this server.")
+                return
+
+            if lowered.isdigit():
+                requested_limit = int(lowered)
+                continue
+
+            await ctx.reply("[x] Invalid option. Use optional #channel and optional limit (100-20000).")
+            return
+
+        per_channel_limit = max(100, min(20000, requested_limit))
+        channels: list[discord.TextChannel] = [selected_channel] if selected_channel is not None else list(ctx.guild.text_channels)
+
+        me = ctx.guild.me
+        if me is None:
+            await ctx.reply("[x] Could not resolve bot member permissions.")
+            return
+
+        await ctx.reply(
+            f"Starting backfill. Scope={'1 channel' if selected_channel else 'all text channels'}, "
+            f"limit={per_channel_limit} per channel."
+        )
+
+        scanned_total = 0
+        added_total = 0
+        batch: list[tuple[int, int, int, int, str, str]] = []
+        batch_size = 500
+
+        for channel in channels:
+            perms = channel.permissions_for(me)
+            if not perms.read_messages or not perms.read_message_history:
+                continue
+
+            try:
+                async for msg in channel.history(limit=per_channel_limit):
+                    if msg.author.bot:
+                        continue
+
+                    scanned_total += 1
+                    batch.append(
+                        (
+                            ctx.guild.id,
+                            channel.id,
+                            msg.id,
+                            msg.author.id,
+                            str(msg.author),
+                            msg.created_at.astimezone(timezone.utc).isoformat(),
+                        )
+                    )
+
+                    if len(batch) >= batch_size:
+                        added_total += record_chat_events(batch)
+                        batch.clear()
+            except Exception:
+                logger.exception("Failed backfill read for channel=%s guild=%s", channel.id, ctx.guild.id)
+
+        if batch:
+            added_total += record_chat_events(batch)
+
+        await ctx.send(
+            f"Backfill complete. scanned={scanned_total}, added={added_total}, "
+            f"ignored_duplicates={max(0, scanned_total - added_total)}"
+        )
+
     @bot.tree.command(name="activity_top", description="Show top active users in this server")
     @app_commands.describe(
         limit="How many users to display (1-50)",
@@ -425,3 +593,80 @@ def register_activity_feature(
                 await interaction.followup.send("[x] Failed to export activity file.", ephemeral=True)
             else:
                 await interaction.response.send_message("[x] Failed to export activity file.", ephemeral=True)
+
+    @bot.tree.command(name="activity_backfill", description="Backfill past chat messages into activity stats (owner only)")
+    @app_commands.describe(
+        limit="How many recent messages to scan per channel (100-20000)",
+        channel="Optional channel to backfill; default scans all text channels",
+    )
+    async def activity_backfill_slash(
+        interaction: discord.Interaction,
+        limit: app_commands.Range[int, 100, 20000] = 2000,
+        channel: Optional[discord.TextChannel] = None,
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("[x] This command can only be used in a server.", ephemeral=True)
+            return
+
+        if owner_user_id == 0:
+            await interaction.response.send_message("[x] DISCORD_OWNER_ID is not configured.", ephemeral=True)
+            return
+
+        if not is_owner_user(interaction.user.id):
+            await interaction.response.send_message(
+                "[x] This backfill command is private and only available to the owner.",
+                ephemeral=True,
+            )
+            return
+
+        guild = interaction.guild
+        me = guild.me
+        if me is None:
+            await interaction.response.send_message("[x] Could not resolve bot member permissions.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
+        channels: list[discord.TextChannel] = [channel] if channel is not None else list(guild.text_channels)
+        per_channel_limit = int(limit)
+        scanned_total = 0
+        added_total = 0
+        batch: list[tuple[int, int, int, int, str, str]] = []
+        batch_size = 500
+
+        for text_channel in channels:
+            perms = text_channel.permissions_for(me)
+            if not perms.read_messages or not perms.read_message_history:
+                continue
+
+            try:
+                async for msg in text_channel.history(limit=per_channel_limit):
+                    if msg.author.bot:
+                        continue
+
+                    scanned_total += 1
+                    batch.append(
+                        (
+                            guild.id,
+                            text_channel.id,
+                            msg.id,
+                            msg.author.id,
+                            str(msg.author),
+                            msg.created_at.astimezone(timezone.utc).isoformat(),
+                        )
+                    )
+
+                    if len(batch) >= batch_size:
+                        added_total += record_chat_events(batch)
+                        batch.clear()
+            except Exception:
+                logger.exception("Failed slash backfill read for channel=%s guild=%s", text_channel.id, guild.id)
+
+        if batch:
+            added_total += record_chat_events(batch)
+
+        await interaction.followup.send(
+            f"Backfill complete. scanned={scanned_total}, added={added_total}, "
+            f"ignored_duplicates={max(0, scanned_total - added_total)}",
+            ephemeral=True,
+        )

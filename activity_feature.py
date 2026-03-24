@@ -65,6 +65,17 @@ def register_activity_feature(
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS channel_scan_state (
+                    guild_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    last_message_id INTEGER NOT NULL DEFAULT 0,
+                    last_scanned TEXT NOT NULL,
+                    PRIMARY KEY (guild_id, channel_id)
+                )
+                """
+            )
 
             event_columns = {row[1] for row in conn.execute("PRAGMA table_info(user_activity_events)").fetchall()}
             if "channel_id" not in event_columns:
@@ -130,54 +141,70 @@ def register_activity_feature(
         aggregated: dict[tuple[int, int, int], tuple[str, int, str]] = {}
         inserted_messages = 0
 
-        with sqlite3.connect(activity_db_path) as conn:
-            for guild_id, channel_id, message_id, user_id, username, created_at in events:
-                cursor = conn.execute(
-                    """
-                    INSERT OR IGNORE INTO processed_messages
-                    (message_id, guild_id, channel_id, user_id, username, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    (message_id, guild_id, channel_id, user_id, username, created_at),
-                )
-                if cursor.rowcount == 0:
-                    continue
+        def _write_events() -> int:
+            nonlocal inserted_messages
+            with sqlite3.connect(activity_db_path) as conn:
+                for guild_id, channel_id, message_id, user_id, username, created_at in events:
+                    cursor = conn.execute(
+                        """
+                        INSERT OR IGNORE INTO processed_messages
+                        (message_id, guild_id, channel_id, user_id, username, created_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (message_id, guild_id, channel_id, user_id, username, created_at),
+                    )
+                    if cursor.rowcount == 0:
+                        continue
 
-                inserted_messages += 1
-                key = (guild_id, channel_id, user_id)
-                existing = aggregated.get(key)
-                if existing is None:
-                    aggregated[key] = (username, 1, created_at)
-                    continue
+                    inserted_messages += 1
+                    key = (guild_id, channel_id, user_id)
+                    existing = aggregated.get(key)
+                    if existing is None:
+                        aggregated[key] = (username, 1, created_at)
+                        continue
 
-                existing_username, existing_count, existing_last_active = existing
-                latest_active = created_at if created_at > existing_last_active else existing_last_active
-                latest_username = username if created_at >= existing_last_active else existing_username
-                aggregated[key] = (latest_username, existing_count + 1, latest_active)
+                    existing_username, existing_count, existing_last_active = existing
+                    latest_active = created_at if created_at > existing_last_active else existing_last_active
+                    latest_username = username if created_at >= existing_last_active else existing_username
+                    aggregated[key] = (latest_username, existing_count + 1, latest_active)
 
-            for (guild_id, channel_id, user_id), (username, chat_increment, last_active) in aggregated.items():
-                conn.execute(
-                    """
-                    INSERT INTO user_activity (guild_id, user_id, username, chat_count, attack_count, last_active)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(guild_id, user_id) DO UPDATE SET
-                        username = excluded.username,
-                        chat_count = user_activity.chat_count + excluded.chat_count,
-                        attack_count = user_activity.attack_count + excluded.attack_count,
-                        last_active = excluded.last_active
-                    """,
-                    (guild_id, user_id, username, chat_increment, 0, last_active),
-                )
-                conn.execute(
-                    """
-                    INSERT INTO user_activity_events
-                    (guild_id, channel_id, user_id, username, event_type, event_count, created_at)
-                    VALUES (?, ?, ?, ?, 'chat', ?, ?)
-                    """,
-                    (guild_id, channel_id, user_id, username, chat_increment, last_active),
-                )
+                for (guild_id, channel_id, user_id), (username, chat_increment, last_active) in aggregated.items():
+                    conn.execute(
+                        """
+                        INSERT INTO user_activity (guild_id, user_id, username, chat_count, attack_count, last_active)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                            username = excluded.username,
+                            chat_count = user_activity.chat_count + excluded.chat_count,
+                            attack_count = user_activity.attack_count + excluded.attack_count,
+                            last_active = excluded.last_active
+                        """,
+                        (guild_id, user_id, username, chat_increment, 0, last_active),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO user_activity_events
+                        (guild_id, channel_id, user_id, username, event_type, event_count, created_at)
+                        VALUES (?, ?, ?, ?, 'chat', ?, ?)
+                        """,
+                        (guild_id, channel_id, user_id, username, chat_increment, last_active),
+                    )
 
-            conn.commit()
+                conn.commit()
+
+            return inserted_messages
+
+        try:
+            _write_events()
+        except sqlite3.OperationalError as exc:
+            # Handles startup race where message events arrive before tables are initialized.
+            if "no such table" in str(exc).lower():
+                init_activity_db()
+                inserted_messages = 0
+                aggregated.clear()
+                _write_events()
+            else:
+                raise
 
         return inserted_messages
 
@@ -384,6 +411,15 @@ def register_activity_feature(
         if me is None:
             return 0, 0, len(guild.text_channels)
 
+        with sqlite3.connect(activity_db_path) as conn:
+            known_scan_state = {
+                int(row[0]): int(row[1])
+                for row in conn.execute(
+                    "SELECT channel_id, last_message_id FROM channel_scan_state WHERE guild_id = ?",
+                    (guild.id,),
+                ).fetchall()
+            }
+
         scanned_total = 0
         added_total = 0
         skipped_channels = 0
@@ -397,11 +433,21 @@ def register_activity_feature(
                 continue
 
             try:
-                async for msg in channel.history(limit=None):
+                previous_last_message_id = known_scan_state.get(channel.id)
+                latest_seen_message_id = previous_last_message_id or 0
+
+                history_kwargs: dict[str, object] = {"limit": None}
+                if previous_last_message_id:
+                    history_kwargs["after"] = discord.Object(id=previous_last_message_id)
+
+                async for msg in channel.history(**history_kwargs):
                     if msg.author.bot:
                         continue
 
                     scanned_total += 1
+                    if msg.id > latest_seen_message_id:
+                        latest_seen_message_id = msg.id
+
                     batch.append(
                         (
                             guild.id,
@@ -416,6 +462,21 @@ def register_activity_feature(
                     if len(batch) >= batch_size:
                         added_total += record_chat_events(batch)
                         batch.clear()
+
+                if latest_seen_message_id > 0:
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    with sqlite3.connect(activity_db_path) as conn:
+                        conn.execute(
+                            """
+                            INSERT INTO channel_scan_state (guild_id, channel_id, last_message_id, last_scanned)
+                            VALUES (?, ?, ?, ?)
+                            ON CONFLICT(guild_id, channel_id) DO UPDATE SET
+                                last_message_id = excluded.last_message_id,
+                                last_scanned = excluded.last_scanned
+                            """,
+                            (guild.id, channel.id, latest_seen_message_id, now_iso),
+                        )
+                        conn.commit()
             except Exception:
                 skipped_channels += 1
                 logger.exception("Failed export scan for channel=%s guild=%s", channel.id, guild.id)
@@ -428,6 +489,9 @@ def register_activity_feature(
     @bot.listen("on_ready")
     async def activity_on_ready() -> None:
         init_activity_db()
+
+    # Initialize immediately as well to avoid on_message race during startup.
+    init_activity_db()
 
     @bot.listen("on_message")
     async def activity_on_message(message: discord.Message) -> None:
@@ -593,7 +657,7 @@ def register_activity_feature(
             await ctx.reply("[x] DISCORD_OWNER_ID is not configured.")
             return
 
-        await ctx.reply("Scanning all channels from all time before export. This may take a while...")
+        await ctx.reply("Scanning channels before export (first run scans all time; next runs are incremental).")
 
         try:
             scanned_total, added_total, skipped_channels = await scan_full_guild_history(ctx.guild)
@@ -604,7 +668,7 @@ def register_activity_feature(
             await ctx.author.send(file=discord.File(excel_bytes, filename=filename))
             await ctx.send(
                 "I sent the activity Excel file to your DM. "
-                f"scan: scanned={scanned_total}, added={added_total}, "
+                f"incremental scan: scanned={scanned_total}, added={added_total}, "
                 f"ignored_duplicates={max(0, scanned_total - added_total)}, skipped_channels={skipped_channels}"
             )
         except Exception:
@@ -693,7 +757,7 @@ def register_activity_feature(
         )
         await interaction.response.send_message(embed=embed)
 
-    @bot.tree.command(name="activity_export", description="Scan all channels (all time) and export activity report")
+    @bot.tree.command(name="activity_export", description="Export activity report with fast incremental scan")
     async def activity_export_slash(
         interaction: discord.Interaction,
     ) -> None:
@@ -721,7 +785,7 @@ def register_activity_feature(
                 f"activity_export_all_allch_{interaction.guild_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
             )
             await interaction.followup.send(
-                "Activity report generated after full scan. "
+                "Activity report generated after incremental scan. "
                 f"scanned={scanned_total}, added={added_total}, "
                 f"ignored_duplicates={max(0, scanned_total - added_total)}, skipped_channels={skipped_channels}",
                 file=discord.File(excel_bytes, filename=filename),

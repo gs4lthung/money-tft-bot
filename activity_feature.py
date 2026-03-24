@@ -351,6 +351,34 @@ def register_activity_feature(
         output.seek(0)
         return output
 
+    def get_inactive_members(
+        guild: discord.Guild,
+        period: str = "all",
+        channel_id: Optional[int] = None,
+    ) -> list[tuple[str, str]]:
+        rows = get_activity_rows_for_export(guild.id, period=period, channel_id=channel_id)
+        by_user_id: dict[int, tuple[str, int, int, int, str]] = {
+            user_id: (username, chat_count, attack_count, total_count, last_active)
+            for user_id, username, chat_count, attack_count, total_count, last_active in rows
+        }
+
+        inactive: list[tuple[str, str]] = []
+        for member in guild.members:
+            if member.bot:
+                continue
+
+            activity = by_user_id.get(member.id)
+            if activity is None:
+                inactive.append((str(member), "never"))
+                continue
+
+            _, _, _, total_count, last_active = activity
+            if total_count == 0:
+                inactive.append((str(member), last_active or "never"))
+
+        inactive.sort(key=lambda x: x[0].lower())
+        return inactive
+
     @bot.listen("on_ready")
     async def activity_on_ready() -> None:
         init_activity_db()
@@ -449,6 +477,58 @@ def register_activity_feature(
             title=f"Top Activity ({period.upper()} | {metric.upper()} | {channel_label} | Top {safe_limit})",
             description="\n".join(lines),
             color=discord.Color.orange(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        await ctx.send(embed=embed)
+
+    @bot.command(name="activity_inactive")
+    async def activity_inactive_prefix(ctx: commands.Context, *args: str) -> None:
+        if ctx.guild is None:
+            await ctx.reply("[x] This command can only be used in a server.")
+            return
+
+        period = "all"
+        limit = 20
+        selected_channel_id: Optional[int] = None
+
+        for arg in args:
+            lowered = arg.lower().strip()
+            channel_match = CHANNEL_MENTION_REGEX.match(arg)
+            if channel_match:
+                selected_channel_id = int(channel_match.group(1))
+                continue
+
+            if lowered.isdigit():
+                limit = int(lowered)
+                continue
+
+            if lowered in period_values:
+                period = lowered
+                continue
+
+            await ctx.reply("[x] Invalid option. Use: all/day/month, optional #channel, and optional limit (1-100).")
+            return
+
+        safe_limit = max(1, min(100, limit))
+        inactive = get_inactive_members(ctx.guild, period=period, channel_id=selected_channel_id)
+
+        if not inactive:
+            await ctx.reply("No inactive users found for this scope.")
+            return
+
+        lines = []
+        for idx, (username, last_active) in enumerate(inactive[:safe_limit], start=1):
+            lines.append(f"{idx}. {username} | last_active={last_active}")
+
+        channel_label = "ALL CHANNELS"
+        if selected_channel_id is not None:
+            channel_obj = ctx.guild.get_channel(selected_channel_id)
+            channel_label = f"#{channel_obj.name}" if channel_obj is not None else f"channel:{selected_channel_id}"
+
+        embed = discord.Embed(
+            title=f"Inactive Users ({period.upper()} | {channel_label} | Top {safe_limit}/{len(inactive)})",
+            description="\n".join(lines),
+            color=discord.Color.red(),
             timestamp=datetime.now(timezone.utc),
         )
         await ctx.send(embed=embed)
@@ -626,6 +706,43 @@ def register_activity_feature(
             title=f"Top Activity ({period.upper()} | {metric.upper()} | {channel_label} | Top {int(limit)})",
             description="\n".join(lines),
             color=discord.Color.orange(),
+            timestamp=datetime.now(timezone.utc),
+        )
+        await interaction.response.send_message(embed=embed)
+
+    @bot.tree.command(name="activity_inactive", description="Show users with no activity in this server")
+    @app_commands.describe(
+        limit="How many inactive users to display (1-100)",
+        period="Time range to evaluate inactivity",
+        channel="Optional channel filter; default is all channels",
+    )
+    async def activity_inactive_slash(
+        interaction: discord.Interaction,
+        limit: app_commands.Range[int, 1, 100] = 20,
+        period: Literal["all", "day", "month"] = "all",
+        channel: Optional[discord.TextChannel] = None,
+    ) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("[x] This command can only be used in a server.", ephemeral=True)
+            return
+
+        selected_channel_id = channel.id if channel is not None else None
+        inactive = get_inactive_members(interaction.guild, period=period, channel_id=selected_channel_id)
+
+        if not inactive:
+            await interaction.response.send_message("No inactive users found for this scope.", ephemeral=True)
+            return
+
+        lines = []
+        for idx, (username, last_active) in enumerate(inactive[: int(limit)], start=1):
+            lines.append(f"{idx}. {username} | last_active={last_active}")
+
+        channel_label = f"#{channel.name}" if channel is not None else "ALL CHANNELS"
+
+        embed = discord.Embed(
+            title=f"Inactive Users ({period.upper()} | {channel_label} | Top {int(limit)}/{len(inactive)})",
+            description="\n".join(lines),
+            color=discord.Color.red(),
             timestamp=datetime.now(timezone.utc),
         )
         await interaction.response.send_message(embed=embed)

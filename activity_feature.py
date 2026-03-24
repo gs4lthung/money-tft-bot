@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import re
 import sqlite3
@@ -435,6 +436,16 @@ def register_activity_feature(
             try:
                 previous_last_message_id = known_scan_state.get(channel.id)
                 latest_seen_message_id = previous_last_message_id or 0
+                channel_last_message_id = int(channel.last_message_id or 0)
+
+                # Fast path: if we already scanned this channel up to the current last message,
+                # skip history calls entirely.
+                if previous_last_message_id and channel_last_message_id and channel_last_message_id <= previous_last_message_id:
+                    continue
+
+                # Fast path: empty channel, no need to call history API.
+                if channel_last_message_id == 0:
+                    continue
 
                 history_kwargs: dict[str, object] = {"limit": None}
                 if previous_last_message_id:
@@ -477,6 +488,9 @@ def register_activity_feature(
                             (guild.id, channel.id, latest_seen_message_id, now_iso),
                         )
                         conn.commit()
+
+                # Smooth out request bursts across channels to reduce 429 responses.
+                await asyncio.sleep(0.2)
             except Exception:
                 skipped_channels += 1
                 logger.exception("Failed export scan for channel=%s guild=%s", channel.id, guild.id)

@@ -384,47 +384,49 @@ def register_activity_feature(
         output.seek(0)
         return output
 
-    def get_inactive_members(
+    def get_member_activity_list(
         guild: discord.Guild,
         period: str = "all",
         channel_id: Optional[int] = None,
-    ) -> list[tuple[int, str, str]]:
+    ) -> list[tuple[int, str, int, int, int, str]]:
         rows = get_activity_rows_for_export(guild.id, period=period, channel_id=channel_id)
         by_user_id: dict[int, tuple[str, int, int, int, str]] = {
             user_id: (username, chat_count, attack_count, total_count, last_active)
             for user_id, username, chat_count, attack_count, total_count, last_active in rows
         }
 
-        inactive: list[tuple[int, str, str]] = []
+        members: list[tuple[int, str, int, int, int, str]] = []
         for member in guild.members:
             if member.bot:
                 continue
 
             activity = by_user_id.get(member.id)
             if activity is None:
-                inactive.append((member.id, str(member), "never"))
+                members.append((member.id, str(member), 0, 0, 0, "never"))
                 continue
 
-            _, chat_count, _, _, last_active = activity
-            if chat_count == 0:
-                inactive.append((member.id, str(member), last_active or "never"))
+            _, chat_count, attack_count, total_count, last_active = activity
+            members.append((member.id, str(member), chat_count, attack_count, total_count, last_active or "never"))
 
-        inactive.sort(key=lambda x: x[1].lower())
-        return inactive
+        members.sort(key=lambda x: x[1].lower())
+        return members
 
-    def build_inactive_embed(
-        inactive: list[tuple[int, str, str]],
+    def build_member_activity_embed(
+        members: list[tuple[int, str, int, int, int, str]],
         page_index: int,
         period: str,
         channel_label: str,
         selected_user_id: Optional[int] = None,
+        show_inactive_only: bool = False,
+        total_members: Optional[int] = None,
     ) -> discord.Embed:
-        total = len(inactive)
+        total = len(members)
         if total == 0:
+            filter_text = "inactive only" if show_inactive_only else "all members"
             return discord.Embed(
-                title=f"Inactive Users ({period.upper()} | {channel_label})",
-                description="No inactive users found for this scope.",
-                color=discord.Color.red(),
+                title=f"Member Activity ({period.upper()} | {channel_label})",
+                description=f"No users found for {filter_text}.",
+                color=discord.Color.orange(),
                 timestamp=datetime.now(timezone.utc),
             )
 
@@ -434,39 +436,55 @@ def register_activity_feature(
         end = min(start + inactive_page_size, total)
 
         lines = []
-        for idx, (user_id, username, last_active) in enumerate(inactive[start:end], start=start + 1):
+        for idx, (user_id, username, chat_count, attack_count, total_count_row, last_active) in enumerate(
+            members[start:end],
+            start=start + 1,
+        ):
             marker = " [selected]" if selected_user_id == user_id else ""
-            lines.append(f"{idx}. <@{user_id}> ({username}) | last_active={last_active}{marker}")
+            inactive_tag = " | NO CHAT" if chat_count == 0 else ""
+            lines.append(
+                f"{idx}. <@{user_id}> ({username}) | chat={chat_count} | attack={attack_count} "
+                f"| total={total_count_row} | last_active={last_active}{inactive_tag}{marker}"
+            )
 
+        filter_text = "INACTIVE ONLY" if show_inactive_only else "ALL MEMBERS"
         embed = discord.Embed(
-            title=f"Inactive Users ({period.upper()} | {channel_label})",
+            title=f"Member Activity ({period.upper()} | {channel_label})",
             description="\n".join(lines),
-            color=discord.Color.red(),
+            color=discord.Color.blurple(),
             timestamp=datetime.now(timezone.utc),
         )
-        embed.set_footer(text=f"Page {safe_page + 1}/{total_pages} | Total inactive: {total}")
+        inactive_count = sum(1 for _, _, chat_count, _, _, _ in members if chat_count == 0)
+        footer_total = total_members if total_members is not None else total
+        embed.set_footer(
+            text=(
+                f"Page {safe_page + 1}/{total_pages} | Filter: {filter_text} | "
+                f"Showing {total}/{footer_total} | Inactive in view: {inactive_count}"
+            )
+        )
         return embed
 
-    class InactiveMembersView(discord.ui.View):
+    class ActivityMembersView(discord.ui.View):
         def __init__(
             self,
             author_id: int,
             guild: discord.Guild,
-            inactive: list[tuple[int, str, str]],
+            members: list[tuple[int, str, int, int, int, str]],
             period: str,
             channel_label: str,
         ) -> None:
             super().__init__(timeout=300)
             self.author_id = author_id
             self.guild = guild
-            self.inactive = inactive
+            self.members = members
             self.period = period
             self.channel_label = channel_label
             self.page_index = 0
             self.selected_user_id: Optional[int] = None
+            self.show_inactive_only = False
 
             self.select_user_menu = discord.ui.Select(
-                placeholder="Select an inactive user",
+                placeholder="Select a user",
                 min_values=1,
                 max_values=1,
                 options=[discord.SelectOption(label="No users", value="0")],
@@ -476,21 +494,31 @@ def register_activity_feature(
             self.add_item(self.select_user_menu)
             self._refresh_components()
 
+        def _filtered_members(self) -> list[tuple[int, str, int, int, int, str]]:
+            if not self.show_inactive_only:
+                return self.members
+            return [row for row in self.members if row[2] == 0]
+
         def _refresh_components(self) -> None:
-            total_pages = max(1, (len(self.inactive) + inactive_page_size - 1) // inactive_page_size)
+            filtered_members = self._filtered_members()
+            total_pages = max(1, (len(filtered_members) + inactive_page_size - 1) // inactive_page_size)
             safe_page = max(0, min(self.page_index, total_pages - 1))
             self.page_index = safe_page
             start = safe_page * inactive_page_size
-            end = min(start + inactive_page_size, len(self.inactive))
-            current_page_user_ids = {user_id for user_id, _, _ in self.inactive[start:end]}
+            end = min(start + inactive_page_size, len(filtered_members))
+            current_page_user_ids = {user_id for user_id, _, _, _, _, _ in filtered_members[start:end]}
 
             options: list[discord.SelectOption] = []
-            for idx, (user_id, username, last_active) in enumerate(self.inactive[start:end], start=start + 1):
+            for idx, (user_id, username, chat_count, _, _, last_active) in enumerate(
+                filtered_members[start:end],
+                start=start + 1,
+            ):
                 numbered_label = f"{idx}. {username}"
+                inactive_desc = "NO CHAT" if chat_count == 0 else "ACTIVE"
                 options.append(
                     discord.SelectOption(
                         label=numbered_label[:100],
-                        description=f"last_active={last_active}"[:100],
+                        description=f"chat={chat_count} | {inactive_desc} | last_active={last_active}"[:100],
                         value=str(user_id),
                         default=self.selected_user_id == user_id,
                     )
@@ -509,6 +537,10 @@ def register_activity_feature(
             self.prev_button.disabled = safe_page <= 0
             self.next_button.disabled = safe_page >= total_pages - 1
             self.kick_button.disabled = self.selected_user_id is None
+            self.toggle_filter_button.label = "Show All Members" if self.show_inactive_only else "Show Inactive Only"
+            self.toggle_filter_button.style = (
+                discord.ButtonStyle.success if self.show_inactive_only else discord.ButtonStyle.primary
+            )
 
         async def interaction_check(self, interaction: discord.Interaction) -> bool:
             if interaction.user.id != self.author_id:
@@ -520,13 +552,16 @@ def register_activity_feature(
             selected_value = self.select_user_menu.values[0]
             self.selected_user_id = None if selected_value == "0" else int(selected_value)
             self._refresh_components()
+            filtered_members = self._filtered_members()
             await interaction.response.edit_message(
-                embed=build_inactive_embed(
-                    self.inactive,
+                embed=build_member_activity_embed(
+                    filtered_members,
                     self.page_index,
                     self.period,
                     self.channel_label,
                     selected_user_id=self.selected_user_id,
+                    show_inactive_only=self.show_inactive_only,
+                    total_members=len(self.members),
                 ),
                 view=self,
             )
@@ -535,29 +570,55 @@ def register_activity_feature(
         async def prev_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
             self.page_index = max(0, self.page_index - 1)
             self._refresh_components()
+            filtered_members = self._filtered_members()
             await interaction.response.edit_message(
-                embed=build_inactive_embed(
-                    self.inactive,
+                embed=build_member_activity_embed(
+                    filtered_members,
                     self.page_index,
                     self.period,
                     self.channel_label,
                     selected_user_id=self.selected_user_id,
+                    show_inactive_only=self.show_inactive_only,
+                    total_members=len(self.members),
                 ),
                 view=self,
             )
 
         @discord.ui.button(label="Next", style=discord.ButtonStyle.secondary)
         async def next_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
-            total_pages = max(1, (len(self.inactive) + inactive_page_size - 1) // inactive_page_size)
+            filtered_members = self._filtered_members()
+            total_pages = max(1, (len(filtered_members) + inactive_page_size - 1) // inactive_page_size)
             self.page_index = min(total_pages - 1, self.page_index + 1)
             self._refresh_components()
             await interaction.response.edit_message(
-                embed=build_inactive_embed(
-                    self.inactive,
+                embed=build_member_activity_embed(
+                    filtered_members,
                     self.page_index,
                     self.period,
                     self.channel_label,
                     selected_user_id=self.selected_user_id,
+                    show_inactive_only=self.show_inactive_only,
+                    total_members=len(self.members),
+                ),
+                view=self,
+            )
+
+        @discord.ui.button(label="Show Inactive Only", style=discord.ButtonStyle.primary)
+        async def toggle_filter_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+            self.show_inactive_only = not self.show_inactive_only
+            self.page_index = 0
+            self.selected_user_id = None
+            self._refresh_components()
+            filtered_members = self._filtered_members()
+            await interaction.response.edit_message(
+                embed=build_member_activity_embed(
+                    filtered_members,
+                    self.page_index,
+                    self.period,
+                    self.channel_label,
+                    selected_user_id=self.selected_user_id,
+                    show_inactive_only=self.show_inactive_only,
+                    total_members=len(self.members),
                 ),
                 view=self,
             )
@@ -566,6 +627,18 @@ def register_activity_feature(
         async def kick_button(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
             if self.selected_user_id is None:
                 await interaction.response.send_message("[x] Select a user first.", ephemeral=True)
+                return
+
+            selected_row = next((row for row in self.members if row[0] == self.selected_user_id), None)
+            if selected_row is None:
+                await interaction.response.send_message("[x] Selected user no longer exists in the list.", ephemeral=True)
+                return
+
+            if selected_row[2] > 0:
+                await interaction.response.send_message(
+                    "[x] Kick action in this panel is only for inactive users (chat=0).",
+                    ephemeral=True,
+                )
                 return
 
             if not interaction.user.guild_permissions.kick_members:
@@ -600,11 +673,19 @@ def register_activity_feature(
                 await interaction.response.send_message("[x] Kick failed due to an unexpected error.", ephemeral=True)
                 return
 
-            self.inactive = [u for u in self.inactive if u[0] != self.selected_user_id]
+            self.members = [u for u in self.members if u[0] != self.selected_user_id]
             self.selected_user_id = None
             self._refresh_components()
+            filtered_members = self._filtered_members()
             await interaction.response.edit_message(
-                embed=build_inactive_embed(self.inactive, self.page_index, self.period, self.channel_label),
+                embed=build_member_activity_embed(
+                    filtered_members,
+                    self.page_index,
+                    self.period,
+                    self.channel_label,
+                    show_inactive_only=self.show_inactive_only,
+                    total_members=len(self.members),
+                ),
                 view=self,
             )
             await interaction.followup.send("User kicked successfully.", ephemeral=True)
@@ -802,16 +883,16 @@ def register_activity_feature(
                 await ctx.reply(f"[x] Please wait {wait_seconds}s before running export again.")
                 return
 
-        await ctx.reply("Scanning channels before showing inactive list...")
+        await ctx.reply("Scanning channels before showing member activity list...")
 
         try:
             async with export_scan_lock:
                 scanned_total, added_total, skipped_channels = await scan_full_guild_history(ctx.guild)
                 last_export_scan_at[ctx.guild.id] = datetime.now(timezone.utc)
 
-            inactive = get_inactive_members(ctx.guild, period="all", channel_id=None)
-            if not inactive:
-                await ctx.send("No inactive users found after scan.")
+            members = get_member_activity_list(ctx.guild, period="all", channel_id=None)
+            if not members:
+                await ctx.send("No members found after scan.")
                 return
 
             await ctx.send(
@@ -821,19 +902,29 @@ def register_activity_feature(
             )
 
             channel_label = "ALL CHANNELS"
-            view = InactiveMembersView(
+            view = ActivityMembersView(
                 author_id=ctx.author.id,
                 guild=ctx.guild,
-                inactive=inactive,
+                members=members,
                 period="all",
                 channel_label=channel_label,
             )
-            await ctx.send(embed=build_inactive_embed(inactive, 0, "all", channel_label), view=view)
+            await ctx.send(
+                embed=build_member_activity_embed(
+                    members,
+                    0,
+                    "all",
+                    channel_label,
+                    show_inactive_only=False,
+                    total_members=len(members),
+                ),
+                view=view,
+            )
         except Exception:
             logger.exception("Failed to export activity for guild=%s", ctx.guild.id)
-            await ctx.reply("[x] Failed to load inactive list.")
+            await ctx.reply("[x] Failed to load member activity list.")
 
-    @bot.tree.command(name="activity_export", description="Show inactive user list with pagination and kick controls")
+    @bot.tree.command(name="activity_export", description="Show member activity list with inactive toggle and kick controls")
     async def activity_export_slash(
         interaction: discord.Interaction,
     ) -> None:
@@ -874,30 +965,37 @@ def register_activity_feature(
                 scanned_total, added_total, skipped_channels = await scan_full_guild_history(interaction.guild)
                 last_export_scan_at[interaction.guild.id] = datetime.now(timezone.utc)
 
-            inactive = get_inactive_members(interaction.guild, period="all", channel_id=None)
-            if not inactive:
-                await interaction.followup.send("No inactive users found after scan.", ephemeral=True)
+            members = get_member_activity_list(interaction.guild, period="all", channel_id=None)
+            if not members:
+                await interaction.followup.send("No members found after scan.", ephemeral=True)
                 return
 
             channel_label = "ALL CHANNELS"
-            view = InactiveMembersView(
+            view = ActivityMembersView(
                 author_id=interaction.user.id,
                 guild=interaction.guild,
-                inactive=inactive,
+                members=members,
                 period="all",
                 channel_label=channel_label,
             )
             await interaction.followup.send(
-                "Inactive list ready after scan. "
+                "Member activity list ready after scan. "
                 f"scanned={scanned_total}, added={added_total}, "
                 f"ignored_duplicates={max(0, scanned_total - added_total)}, skipped_channels={skipped_channels}",
-                embed=build_inactive_embed(inactive, 0, "all", channel_label),
+                embed=build_member_activity_embed(
+                    members,
+                    0,
+                    "all",
+                    channel_label,
+                    show_inactive_only=False,
+                    total_members=len(members),
+                ),
                 view=view,
                 ephemeral=True,
             )
         except Exception:
             logger.exception("Failed slash activity export for guild=%s", interaction.guild_id)
             if interaction.response.is_done():
-                await interaction.followup.send("[x] Failed to load inactive list.", ephemeral=True)
+                await interaction.followup.send("[x] Failed to load member activity list.", ephemeral=True)
             else:
-                await interaction.response.send_message("[x] Failed to load inactive list.", ephemeral=True)
+                await interaction.response.send_message("[x] Failed to load member activity list.", ephemeral=True)

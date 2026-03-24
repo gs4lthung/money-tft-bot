@@ -388,31 +388,33 @@ def register_activity_feature(
         guild: discord.Guild,
         period: str = "all",
         channel_id: Optional[int] = None,
-    ) -> list[tuple[int, str, int, int, int, str]]:
+    ) -> list[tuple[int, str, int, int, int, str, str]]:
         rows = get_activity_rows_for_export(guild.id, period=period, channel_id=channel_id)
         by_user_id: dict[int, tuple[str, int, int, int, str]] = {
             user_id: (username, chat_count, attack_count, total_count, last_active)
             for user_id, username, chat_count, attack_count, total_count, last_active in rows
         }
 
-        members: list[tuple[int, str, int, int, int, str]] = []
+        members: list[tuple[int, str, int, int, int, str, str]] = []
         for member in guild.members:
             if member.bot:
                 continue
 
+            role_name = member.top_role.name if member.top_role is not None else "unknown"
+
             activity = by_user_id.get(member.id)
             if activity is None:
-                members.append((member.id, str(member), 0, 0, 0, "never"))
+                members.append((member.id, str(member), 0, 0, 0, "never", role_name))
                 continue
 
             _, chat_count, attack_count, total_count, last_active = activity
-            members.append((member.id, str(member), chat_count, attack_count, total_count, last_active or "never"))
+            members.append((member.id, str(member), chat_count, attack_count, total_count, last_active or "never", role_name))
 
         members.sort(key=lambda x: x[1].lower())
         return members
 
     def build_member_activity_embed(
-        members: list[tuple[int, str, int, int, int, str]],
+        members: list[tuple[int, str, int, int, int, str, str]],
         page_index: int,
         period: str,
         channel_label: str,
@@ -437,15 +439,14 @@ def register_activity_feature(
         end = min(start + inactive_page_size, total)
 
         lines = []
-        for idx, (user_id, username, chat_count, attack_count, total_count_row, last_active) in enumerate(
+        for idx, (user_id, username, chat_count, _attack_count, _total_count_row, last_active, role_name) in enumerate(
             members[start:end],
             start=start + 1,
         ):
             marker = " [selected]" if selected_user_id == user_id else ""
-            inactive_tag = " | NO CHAT" if chat_count == 0 else ""
             lines.append(
-                f"{idx}. <@{user_id}> ({username}) | chat={chat_count} "
-                f"| last_active={last_active}{inactive_tag}{marker}"
+                f"{idx}. <@{user_id}> ({username}) | role={role_name} | chat={chat_count} "
+                f"| last_active={last_active}{marker}"
             )
 
         filter_text = "INACTIVE ONLY" if show_inactive_only else "ALL MEMBERS"
@@ -455,7 +456,7 @@ def register_activity_feature(
             color=discord.Color.blurple(),
             timestamp=datetime.now(timezone.utc),
         )
-        inactive_count = sum(1 for _, _, chat_count, _, _, _ in members if chat_count == 0)
+        inactive_count = sum(1 for _, _, chat_count, _, _, _, _ in members if chat_count == 0)
         footer_total = total_members if total_members is not None else total
         embed.set_footer(
             text=(
@@ -470,7 +471,7 @@ def register_activity_feature(
             self,
             author_id: int,
             guild: discord.Guild,
-            members: list[tuple[int, str, int, int, int, str]],
+            members: list[tuple[int, str, int, int, int, str, str]],
             period: str,
             channel_label: str,
         ) -> None:
@@ -506,7 +507,7 @@ def register_activity_feature(
         def _current_sort_label(self) -> str:
             return self._sort_modes[self.sort_mode_index][1]
 
-        def _visible_members(self) -> list[tuple[int, str, int, int, int, str]]:
+        def _visible_members(self) -> list[tuple[int, str, int, int, int, str, str]]:
             if self.show_inactive_only:
                 filtered = [row for row in self.members if row[2] == 0]
             else:
@@ -527,19 +528,18 @@ def register_activity_feature(
             self.page_index = safe_page
             start = safe_page * inactive_page_size
             end = min(start + inactive_page_size, len(filtered_members))
-            current_page_user_ids = {user_id for user_id, _, _, _, _, _ in filtered_members[start:end]}
+            current_page_user_ids = {user_id for user_id, _, _, _, _, _, _ in filtered_members[start:end]}
 
             options: list[discord.SelectOption] = []
-            for idx, (user_id, username, chat_count, _, _, last_active) in enumerate(
+            for idx, (user_id, username, chat_count, _, _, last_active, role_name) in enumerate(
                 filtered_members[start:end],
                 start=start + 1,
             ):
                 numbered_label = f"{idx}. {username}"
-                inactive_desc = "NO CHAT" if chat_count == 0 else "ACTIVE"
                 options.append(
                     discord.SelectOption(
                         label=numbered_label[:100],
-                        description=f"chat={chat_count} | {inactive_desc} | last_active={last_active}"[:100],
+                        description=f"role={role_name} | chat={chat_count} | last_active={last_active}"[:100],
                         value=str(user_id),
                         default=self.selected_user_id == user_id,
                     )

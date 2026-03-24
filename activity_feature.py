@@ -779,130 +779,14 @@ def register_activity_feature(
         except Exception:
             logger.exception("Failed to record attack activity for user=%s in guild=%s", user_id, guild_id)
 
-    @bot.command(name="activity_top")
-    async def activity_top_prefix(ctx: commands.Context, *args: str) -> None:
-        if ctx.guild is None:
-            await ctx.reply("[x] This command can only be used in a server.")
-            return
-
-        period = "all"
-        metric = "total"
-        limit = 10
-        selected_channel_id: Optional[int] = None
-
-        for arg in args:
-            lowered = arg.lower().strip()
-            channel_match = CHANNEL_MENTION_REGEX.match(arg)
-            if channel_match:
-                selected_channel_id = int(channel_match.group(1))
-                continue
-
-            if lowered.isdigit():
-                limit = int(lowered)
-                continue
-            if lowered in period_values:
-                period = lowered
-                continue
-            if lowered in metric_values:
-                metric = lowered
-                continue
-
-            await ctx.reply("[x] Invalid option. Use: all/day/month, total/chat/attack, optional #channel, and optional limit (1-50).")
-            return
-
-        safe_limit = max(1, min(50, limit))
-        rows = get_top_activity_rows(
-            ctx.guild.id,
-            safe_limit,
-            period=period,
-            metric=metric,
-            channel_id=selected_channel_id,
-        )
-        if not rows:
-            await ctx.reply("No activity data yet.")
-            return
-
-        lines = []
-        for idx, row in enumerate(rows, start=1):
-            username, chat_count, attack_count, total_count, _ = row
-            lines.append(f"{idx}. {username} | chat={chat_count} | attack={attack_count} | total={total_count}")
-
-        channel_label = "ALL CHANNELS"
-        if selected_channel_id is not None:
-            channel_obj = ctx.guild.get_channel(selected_channel_id)
-            channel_label = f"#{channel_obj.name}" if channel_obj is not None else f"channel:{selected_channel_id}"
-
-        embed = discord.Embed(
-            title=f"Top Activity ({period.upper()} | {metric.upper()} | {channel_label} | Top {safe_limit})",
-            description="\n".join(lines),
-            color=discord.Color.orange(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        await ctx.send(embed=embed)
-
-    @bot.command(name="activity_inactive")
-    async def activity_inactive_prefix(ctx: commands.Context, *args: str) -> None:
-        if ctx.guild is None:
-            await ctx.reply("[x] This command can only be used in a server.")
-            return
-
-        period = "all"
-        selected_channel_id: Optional[int] = None
-
-        for arg in args:
-            lowered = arg.lower().strip()
-            channel_match = CHANNEL_MENTION_REGEX.match(arg)
-            if channel_match:
-                selected_channel_id = int(channel_match.group(1))
-                continue
-
-            if lowered in period_values:
-                period = lowered
-                continue
-
-            await ctx.reply("[x] Invalid option. Use: all/day/month and optional #channel.")
-            return
-
-        inactive = get_inactive_members(ctx.guild, period=period, channel_id=selected_channel_id)
-
-        if not inactive:
-            await ctx.reply("No inactive users found for this scope.")
-            return
-
-        channel_label = "ALL CHANNELS"
-        if selected_channel_id is not None:
-            channel_obj = ctx.guild.get_channel(selected_channel_id)
-            channel_label = f"#{channel_obj.name}" if channel_obj is not None else f"channel:{selected_channel_id}"
-
-        if period == "all" and selected_channel_id is None:
-            bootstrapped, scanned_total, added_total, skipped_channels = await bootstrap_all_time_activity_if_needed(ctx.guild)
-            if bootstrapped:
-                await ctx.send(
-                    "No cached all-time activity found, so I scanned history first. "
-                    f"scanned={scanned_total}, added={added_total}, skipped_channels={skipped_channels}"
-                )
-
-        view = InactiveMembersView(
-            author_id=ctx.author.id,
-            guild=ctx.guild,
-            inactive=inactive,
-            period=period,
-            channel_label=channel_label,
-        )
-        await ctx.send(embed=build_inactive_embed(inactive, 0, period, channel_label), view=view)
-
     @bot.command(name="activity_export")
     async def activity_export_prefix(ctx: commands.Context) -> None:
         if ctx.guild is None:
             await ctx.reply("[x] This command can only be used in a server.")
             return
 
-        if not is_owner_user(ctx.author.id):
-            await ctx.reply("[x] This export command is private and only available to the owner.")
-            return
-
-        if owner_user_id == 0:
-            await ctx.reply("[x] DISCORD_OWNER_ID is not configured.")
+        if not ctx.author.guild_permissions.kick_members:
+            await ctx.reply("[x] You need Kick Members permission to run this command.")
             return
 
         if export_scan_lock.locked():
@@ -918,130 +802,38 @@ def register_activity_feature(
                 await ctx.reply(f"[x] Please wait {wait_seconds}s before running export again.")
                 return
 
-        await ctx.reply("Scanning channels before export (first run scans all time; next runs are incremental).")
+        await ctx.reply("Scanning channels before showing inactive list...")
 
         try:
             async with export_scan_lock:
                 scanned_total, added_total, skipped_channels = await scan_full_guild_history(ctx.guild)
                 last_export_scan_at[ctx.guild.id] = datetime.now(timezone.utc)
 
-                excel_bytes = build_activity_excel(ctx.guild, period="all", channel_id=None)
-                filename = (
-                    f"activity_export_all_allch_{ctx.guild.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-                )
-                await ctx.author.send(file=discord.File(excel_bytes, filename=filename))
-                await ctx.send(
-                    "I sent the activity Excel file to your DM. "
-                    f"incremental scan: scanned={scanned_total}, added={added_total}, "
-                    f"ignored_duplicates={max(0, scanned_total - added_total)}, skipped_channels={skipped_channels}"
-                )
+            inactive = get_inactive_members(ctx.guild, period="all", channel_id=None)
+            if not inactive:
+                await ctx.send("No inactive users found after scan.")
+                return
+
+            await ctx.send(
+                "Scan complete. "
+                f"scanned={scanned_total}, added={added_total}, "
+                f"ignored_duplicates={max(0, scanned_total - added_total)}, skipped_channels={skipped_channels}"
+            )
+
+            channel_label = "ALL CHANNELS"
+            view = InactiveMembersView(
+                author_id=ctx.author.id,
+                guild=ctx.guild,
+                inactive=inactive,
+                period="all",
+                channel_label=channel_label,
+            )
+            await ctx.send(embed=build_inactive_embed(inactive, 0, "all", channel_label), view=view)
         except Exception:
             logger.exception("Failed to export activity for guild=%s", ctx.guild.id)
-            await ctx.reply("[x] Failed to export activity file.")
+            await ctx.reply("[x] Failed to load inactive list.")
 
-    @bot.tree.command(name="activity_top", description="Show top active users in this server")
-    @app_commands.describe(
-        limit="How many users to display (1-50)",
-        period="Time range: all time, today, or this month",
-        metric="Sort by total, chat, or attack",
-        channel="Optional channel filter; default is all channels",
-    )
-    async def activity_top_slash(
-        interaction: discord.Interaction,
-        limit: app_commands.Range[int, 1, 50] = 10,
-        period: Literal["all", "day", "month"] = "all",
-        metric: Literal["total", "chat", "attack"] = "total",
-        channel: Optional[discord.TextChannel] = None,
-    ) -> None:
-        if interaction.guild_id is None:
-            await interaction.response.send_message("[x] This command can only be used in a server.", ephemeral=True)
-            return
-
-        selected_channel_id = channel.id if channel is not None else None
-        rows = get_top_activity_rows(
-            interaction.guild_id,
-            int(limit),
-            period=period,
-            metric=metric,
-            channel_id=selected_channel_id,
-        )
-        if not rows:
-            await interaction.response.send_message("No activity data yet.", ephemeral=True)
-            return
-
-        lines = []
-        for idx, row in enumerate(rows, start=1):
-            username, chat_count, attack_count, total_count, _ = row
-            lines.append(f"{idx}. {username} | chat={chat_count} | attack={attack_count} | total={total_count}")
-
-        channel_label = f"#{channel.name}" if channel is not None else "ALL CHANNELS"
-
-        embed = discord.Embed(
-            title=f"Top Activity ({period.upper()} | {metric.upper()} | {channel_label} | Top {int(limit)})",
-            description="\n".join(lines),
-            color=discord.Color.orange(),
-            timestamp=datetime.now(timezone.utc),
-        )
-        await interaction.response.send_message(embed=embed)
-
-    @bot.tree.command(name="activity_inactive", description="Show users with no activity in this server")
-    @app_commands.describe(
-        period="Time range to evaluate inactivity",
-        channel="Optional channel filter; default is all channels",
-    )
-    async def activity_inactive_slash(
-        interaction: discord.Interaction,
-        period: Literal["all", "day", "month"] = "all",
-        channel: Optional[discord.TextChannel] = None,
-    ) -> None:
-        if interaction.guild is None:
-            await interaction.response.send_message("[x] This command can only be used in a server.", ephemeral=True)
-            return
-
-        selected_channel_id = channel.id if channel is not None else None
-
-        if period == "all" and selected_channel_id is None:
-            await interaction.response.defer(ephemeral=True, thinking=True)
-            bootstrapped, scanned_total, added_total, skipped_channels = await bootstrap_all_time_activity_if_needed(interaction.guild)
-            if bootstrapped:
-                await interaction.followup.send(
-                    "No cached all-time activity found, so I scanned history first. "
-                    f"scanned={scanned_total}, added={added_total}, skipped_channels={skipped_channels}",
-                    ephemeral=True,
-                )
-
-        inactive = get_inactive_members(interaction.guild, period=period, channel_id=selected_channel_id)
-
-        if not inactive:
-            if interaction.response.is_done():
-                await interaction.followup.send("No inactive users found for this scope.", ephemeral=True)
-            else:
-                await interaction.response.send_message("No inactive users found for this scope.", ephemeral=True)
-            return
-
-        channel_label = f"#{channel.name}" if channel is not None else "ALL CHANNELS"
-
-        view = InactiveMembersView(
-            author_id=interaction.user.id,
-            guild=interaction.guild,
-            inactive=inactive,
-            period=period,
-            channel_label=channel_label,
-        )
-        if interaction.response.is_done():
-            await interaction.followup.send(
-                embed=build_inactive_embed(inactive, 0, period, channel_label),
-                view=view,
-                ephemeral=True,
-            )
-        else:
-            await interaction.response.send_message(
-                embed=build_inactive_embed(inactive, 0, period, channel_label),
-                view=view,
-                ephemeral=True,
-            )
-
-    @bot.tree.command(name="activity_export", description="Export activity report with fast incremental scan")
+    @bot.tree.command(name="activity_export", description="Show inactive user list with pagination and kick controls")
     async def activity_export_slash(
         interaction: discord.Interaction,
     ) -> None:
@@ -1049,13 +841,9 @@ def register_activity_feature(
             await interaction.response.send_message("[x] This command can only be used in a server.", ephemeral=True)
             return
 
-        if owner_user_id == 0:
-            await interaction.response.send_message("[x] DISCORD_OWNER_ID is not configured.", ephemeral=True)
-            return
-
-        if not is_owner_user(interaction.user.id):
+        if not interaction.user.guild_permissions.kick_members:
             await interaction.response.send_message(
-                "[x] This export command is private and only available to the owner.",
+                "[x] You need Kick Members permission to run this command.",
                 ephemeral=True,
             )
             return
@@ -1086,20 +874,30 @@ def register_activity_feature(
                 scanned_total, added_total, skipped_channels = await scan_full_guild_history(interaction.guild)
                 last_export_scan_at[interaction.guild.id] = datetime.now(timezone.utc)
 
-                excel_bytes = build_activity_excel(interaction.guild, period="all", channel_id=None)
-                filename = (
-                    f"activity_export_all_allch_{interaction.guild_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-                )
-                await interaction.followup.send(
-                    "Activity report generated after incremental scan. "
-                    f"scanned={scanned_total}, added={added_total}, "
-                    f"ignored_duplicates={max(0, scanned_total - added_total)}, skipped_channels={skipped_channels}",
-                    file=discord.File(excel_bytes, filename=filename),
-                    ephemeral=True,
-                )
+            inactive = get_inactive_members(interaction.guild, period="all", channel_id=None)
+            if not inactive:
+                await interaction.followup.send("No inactive users found after scan.", ephemeral=True)
+                return
+
+            channel_label = "ALL CHANNELS"
+            view = InactiveMembersView(
+                author_id=interaction.user.id,
+                guild=interaction.guild,
+                inactive=inactive,
+                period="all",
+                channel_label=channel_label,
+            )
+            await interaction.followup.send(
+                "Inactive list ready after scan. "
+                f"scanned={scanned_total}, added={added_total}, "
+                f"ignored_duplicates={max(0, scanned_total - added_total)}, skipped_channels={skipped_channels}",
+                embed=build_inactive_embed(inactive, 0, "all", channel_label),
+                view=view,
+                ephemeral=True,
+            )
         except Exception:
             logger.exception("Failed slash activity export for guild=%s", interaction.guild_id)
             if interaction.response.is_done():
-                await interaction.followup.send("[x] Failed to export activity file.", ephemeral=True)
+                await interaction.followup.send("[x] Failed to load inactive list.", ephemeral=True)
             else:
-                await interaction.response.send_message("[x] Failed to export activity file.", ephemeral=True)
+                await interaction.response.send_message("[x] Failed to load inactive list.", ephemeral=True)

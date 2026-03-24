@@ -24,10 +24,12 @@ Notes:
 
 from __future__ import annotations
 
+import io
 import logging
 import os
 import re
 import shlex
+import sqlite3
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -35,6 +37,7 @@ from typing import Optional
 from urllib.parse import urlparse
 
 import discord
+from openpyxl import Workbook
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
@@ -58,6 +61,7 @@ COMMON_LINKS = [
     "https://www.tiktok.com/",
 ]
 ANTI_SPAM_SECONDS = 8.0
+ACTIVITY_DB_PATH = BOT_ROOT / "activity.db"
 
 TIME_REGEX = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
@@ -250,12 +254,96 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     raise RuntimeError("DISCORD_TOKEN is missing. Add it to .env in the bot folder.")
 
+OWNER_USER_ID_RAW = os.getenv("DISCORD_OWNER_ID", "").strip()
+OWNER_USER_ID = int(OWNER_USER_ID_RAW) if OWNER_USER_ID_RAW.isdigit() else 0
+
 intents = discord.Intents.default()
 intents.message_content = True
 
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
 _tree_synced = False
 _slash_last_used: dict[int, float] = {}
+
+
+def init_activity_db() -> None:
+    with sqlite3.connect(ACTIVITY_DB_PATH) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_activity (
+                guild_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                chat_count INTEGER NOT NULL DEFAULT 0,
+                attack_count INTEGER NOT NULL DEFAULT 0,
+                last_active TEXT,
+                PRIMARY KEY (guild_id, user_id)
+            )
+            """
+        )
+        conn.commit()
+
+
+def is_owner_user(user_id: int) -> bool:
+    return OWNER_USER_ID != 0 and user_id == OWNER_USER_ID
+
+
+def record_activity(
+    guild_id: int,
+    user_id: int,
+    username: str,
+    chat_increment: int = 0,
+    attack_increment: int = 0,
+) -> None:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(ACTIVITY_DB_PATH) as conn:
+        conn.execute(
+            """
+            INSERT INTO user_activity (guild_id, user_id, username, chat_count, attack_count, last_active)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(guild_id, user_id) DO UPDATE SET
+                username = excluded.username,
+                chat_count = user_activity.chat_count + excluded.chat_count,
+                attack_count = user_activity.attack_count + excluded.attack_count,
+                last_active = excluded.last_active
+            """,
+            (guild_id, user_id, username, chat_increment, attack_increment, now_iso),
+        )
+        conn.commit()
+
+
+def get_top_activity_rows(guild_id: int, limit: int) -> list[tuple[str, int, int, int, str]]:
+    with sqlite3.connect(ACTIVITY_DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT
+                username,
+                chat_count,
+                attack_count,
+                (chat_count + attack_count) AS total_count,
+                COALESCE(last_active, '')
+            FROM user_activity
+            WHERE guild_id = ?
+            ORDER BY total_count DESC, chat_count DESC, attack_count DESC
+            LIMIT ?
+            """,
+            (guild_id, limit),
+        ).fetchall()
+    return [(str(r[0]), int(r[1]), int(r[2]), int(r[3]), str(r[4])) for r in rows]
+
+
+def build_activity_excel(guild_id: int) -> io.BytesIO:
+    rows = get_top_activity_rows(guild_id, 1000)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Activity"
+    sheet.append(["Username", "Chat Count", "Attack Count", "Total", "Last Active (UTC)"])
+    for row in rows:
+        sheet.append(list(row))
+
+    output = io.BytesIO()
+    workbook.save(output)
+    output.seek(0)
+    return output
 
 
 def slash_is_on_cooldown(user_id: int) -> float:
@@ -277,6 +365,8 @@ def slash_is_on_cooldown(user_id: int) -> float:
 async def on_ready() -> None:
     global _tree_synced
 
+    init_activity_db()
+
     if not _tree_synced:
         try:
             synced = await bot.tree.sync()
@@ -286,6 +376,25 @@ async def on_ready() -> None:
             logger.exception("Slash command sync failed: %s", exc)
 
     logger.info("Logged in as %s (ID: %s)", bot.user, bot.user.id if bot.user else "unknown")
+
+
+@bot.event
+async def on_message(message: discord.Message) -> None:
+    if message.author.bot:
+        return
+
+    if message.guild is not None:
+        try:
+            record_activity(
+                guild_id=message.guild.id,
+                user_id=message.author.id,
+                username=str(message.author),
+                chat_increment=1,
+            )
+        except Exception:
+            logger.exception("Failed to record chat activity for user=%s", message.author.id)
+
+    await bot.process_commands(message)
 
 
 @bot.command(name="attack")
@@ -339,6 +448,13 @@ async def attack_prefix(
         file=local_file,
         allowed_mentions=discord.AllowedMentions(everyone=tag_everyone),
     )
+    if ctx.guild is not None:
+        record_activity(
+            guild_id=ctx.guild.id,
+            user_id=ctx.author.id,
+            username=str(ctx.author),
+            attack_increment=1,
+        )
     logger.info("Prefix attack sent by user=%s(%s)", ctx.author, ctx.author.id)
 
 
@@ -437,7 +553,126 @@ async def attack_slash(
         file=local_file,
         allowed_mentions=discord.AllowedMentions(everyone=tag_everyone),
     )
+    if interaction.guild_id is not None:
+        record_activity(
+            guild_id=interaction.guild_id,
+            user_id=interaction.user.id,
+            username=str(interaction.user),
+            attack_increment=1,
+        )
     logger.info("Slash attack sent by user=%s(%s)", interaction.user, interaction.user.id)
+
+
+@bot.command(name="activity_top")
+async def activity_top_prefix(ctx: commands.Context, limit: int = 10) -> None:
+    if ctx.guild is None:
+        await ctx.reply("[x] This command can only be used in a server.")
+        return
+
+    safe_limit = max(1, min(50, limit))
+    rows = get_top_activity_rows(ctx.guild.id, safe_limit)
+    if not rows:
+        await ctx.reply("No activity data yet.")
+        return
+
+    lines = []
+    for idx, row in enumerate(rows, start=1):
+        username, chat_count, attack_count, total_count, _ = row
+        lines.append(f"{idx}. {username} | chat={chat_count} | attack={attack_count} | total={total_count}")
+
+    embed = discord.Embed(
+        title=f"Top Activity (Top {safe_limit})",
+        description="\n".join(lines),
+        color=discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="activity_export")
+async def activity_export_prefix(ctx: commands.Context) -> None:
+    if ctx.guild is None:
+        await ctx.reply("[x] This command can only be used in a server.")
+        return
+
+    if not is_owner_user(ctx.author.id):
+        await ctx.reply("[x] This export command is private and only available to the owner.")
+        return
+
+    if OWNER_USER_ID == 0:
+        await ctx.reply("[x] DISCORD_OWNER_ID is not configured.")
+        return
+
+    try:
+        excel_bytes = build_activity_excel(ctx.guild.id)
+        filename = f"activity_export_{ctx.guild.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        await ctx.author.send(file=discord.File(excel_bytes, filename=filename))
+        await ctx.reply("I sent the activity Excel file to your DM.")
+    except Exception:
+        logger.exception("Failed to export activity for guild=%s", ctx.guild.id)
+        await ctx.reply("[x] Failed to export activity file.")
+
+
+@bot.tree.command(name="activity_top", description="Show top active users in this server")
+@app_commands.describe(limit="How many users to display (1-50)")
+async def activity_top_slash(
+    interaction: discord.Interaction,
+    limit: app_commands.Range[int, 1, 50] = 10,
+) -> None:
+    if interaction.guild_id is None:
+        await interaction.response.send_message("[x] This command can only be used in a server.", ephemeral=True)
+        return
+
+    rows = get_top_activity_rows(interaction.guild_id, int(limit))
+    if not rows:
+        await interaction.response.send_message("No activity data yet.", ephemeral=True)
+        return
+
+    lines = []
+    for idx, row in enumerate(rows, start=1):
+        username, chat_count, attack_count, total_count, _ = row
+        lines.append(f"{idx}. {username} | chat={chat_count} | attack={attack_count} | total={total_count}")
+
+    embed = discord.Embed(
+        title=f"Top Activity (Top {int(limit)})",
+        description="\n".join(lines),
+        color=discord.Color.orange(),
+        timestamp=datetime.now(timezone.utc),
+    )
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="activity_export", description="Export activity report to Excel (owner only)")
+async def activity_export_slash(interaction: discord.Interaction) -> None:
+    if interaction.guild_id is None:
+        await interaction.response.send_message("[x] This command can only be used in a server.", ephemeral=True)
+        return
+
+    if OWNER_USER_ID == 0:
+        await interaction.response.send_message("[x] DISCORD_OWNER_ID is not configured.", ephemeral=True)
+        return
+
+    if not is_owner_user(interaction.user.id):
+        await interaction.response.send_message(
+            "[x] This export command is private and only available to the owner.",
+            ephemeral=True,
+        )
+        return
+
+    try:
+        excel_bytes = build_activity_excel(interaction.guild_id)
+        filename = f"activity_export_{interaction.guild_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        await interaction.response.send_message(
+            "Activity report generated.",
+            file=discord.File(excel_bytes, filename=filename),
+            ephemeral=True,
+        )
+    except Exception:
+        logger.exception("Failed slash activity export for guild=%s", interaction.guild_id)
+        if interaction.response.is_done():
+            await interaction.followup.send("[x] Failed to export activity file.", ephemeral=True)
+        else:
+            await interaction.response.send_message("[x] Failed to export activity file.", ephemeral=True)
 
 
 @attack_slash.autocomplete("attacker_name")

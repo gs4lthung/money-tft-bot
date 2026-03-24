@@ -26,6 +26,10 @@ def register_activity_feature(
     period_values: set[str],
     metric_values: set[str],
 ) -> None:
+    export_scan_lock = asyncio.Lock()
+    last_export_scan_at: dict[int, datetime] = {}
+    export_scan_cooldown_seconds = 180
+
     def init_activity_db() -> None:
         with sqlite3.connect(activity_db_path) as conn:
             conn.execute(
@@ -426,6 +430,7 @@ def register_activity_feature(
         skipped_channels = 0
         batch: list[tuple[int, int, int, int, str, str]] = []
         batch_size = 500
+        since_pause_counter = 0
 
         for channel in guild.text_channels:
             perms = channel.permissions_for(me)
@@ -456,6 +461,7 @@ def register_activity_feature(
                         continue
 
                     scanned_total += 1
+                    since_pause_counter += 1
                     if msg.id > latest_seen_message_id:
                         latest_seen_message_id = msg.id
 
@@ -474,6 +480,11 @@ def register_activity_feature(
                         added_total += record_chat_events(batch)
                         batch.clear()
 
+                    # Prevent bursty paging over very large channels.
+                    if since_pause_counter >= 250:
+                        await asyncio.sleep(1.0)
+                        since_pause_counter = 0
+
                 if latest_seen_message_id > 0:
                     now_iso = datetime.now(timezone.utc).isoformat()
                     with sqlite3.connect(activity_db_path) as conn:
@@ -490,7 +501,7 @@ def register_activity_feature(
                         conn.commit()
 
                 # Smooth out request bursts across channels to reduce 429 responses.
-                await asyncio.sleep(0.2)
+                await asyncio.sleep(1.0)
             except Exception:
                 skipped_channels += 1
                 logger.exception("Failed export scan for channel=%s guild=%s", channel.id, guild.id)
@@ -671,20 +682,36 @@ def register_activity_feature(
             await ctx.reply("[x] DISCORD_OWNER_ID is not configured.")
             return
 
+        if export_scan_lock.locked():
+            await ctx.reply("[x] Export scan is already running. Please wait for it to finish.")
+            return
+
+        now = datetime.now(timezone.utc)
+        last_run = last_export_scan_at.get(ctx.guild.id)
+        if last_run is not None:
+            elapsed = (now - last_run).total_seconds()
+            if elapsed < export_scan_cooldown_seconds:
+                wait_seconds = int(export_scan_cooldown_seconds - elapsed)
+                await ctx.reply(f"[x] Please wait {wait_seconds}s before running export again.")
+                return
+
         await ctx.reply("Scanning channels before export (first run scans all time; next runs are incremental).")
 
         try:
-            scanned_total, added_total, skipped_channels = await scan_full_guild_history(ctx.guild)
-            excel_bytes = build_activity_excel(ctx.guild, period="all", channel_id=None)
-            filename = (
-                f"activity_export_all_allch_{ctx.guild.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            )
-            await ctx.author.send(file=discord.File(excel_bytes, filename=filename))
-            await ctx.send(
-                "I sent the activity Excel file to your DM. "
-                f"incremental scan: scanned={scanned_total}, added={added_total}, "
-                f"ignored_duplicates={max(0, scanned_total - added_total)}, skipped_channels={skipped_channels}"
-            )
+            async with export_scan_lock:
+                scanned_total, added_total, skipped_channels = await scan_full_guild_history(ctx.guild)
+                last_export_scan_at[ctx.guild.id] = datetime.now(timezone.utc)
+
+                excel_bytes = build_activity_excel(ctx.guild, period="all", channel_id=None)
+                filename = (
+                    f"activity_export_all_allch_{ctx.guild.id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                )
+                await ctx.author.send(file=discord.File(excel_bytes, filename=filename))
+                await ctx.send(
+                    "I sent the activity Excel file to your DM. "
+                    f"incremental scan: scanned={scanned_total}, added={added_total}, "
+                    f"ignored_duplicates={max(0, scanned_total - added_total)}, skipped_channels={skipped_channels}"
+                )
         except Exception:
             logger.exception("Failed to export activity for guild=%s", ctx.guild.id)
             await ctx.reply("[x] Failed to export activity file.")
@@ -790,21 +817,43 @@ def register_activity_feature(
             )
             return
 
+        if export_scan_lock.locked():
+            await interaction.response.send_message(
+                "[x] Export scan is already running. Please wait for it to finish.",
+                ephemeral=True,
+            )
+            return
+
+        now = datetime.now(timezone.utc)
+        last_run = last_export_scan_at.get(interaction.guild.id)
+        if last_run is not None:
+            elapsed = (now - last_run).total_seconds()
+            if elapsed < export_scan_cooldown_seconds:
+                wait_seconds = int(export_scan_cooldown_seconds - elapsed)
+                await interaction.response.send_message(
+                    f"[x] Please wait {wait_seconds}s before running export again.",
+                    ephemeral=True,
+                )
+                return
+
         try:
             await interaction.response.defer(ephemeral=True, thinking=True)
 
-            scanned_total, added_total, skipped_channels = await scan_full_guild_history(interaction.guild)
-            excel_bytes = build_activity_excel(interaction.guild, period="all", channel_id=None)
-            filename = (
-                f"activity_export_all_allch_{interaction.guild_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            )
-            await interaction.followup.send(
-                "Activity report generated after incremental scan. "
-                f"scanned={scanned_total}, added={added_total}, "
-                f"ignored_duplicates={max(0, scanned_total - added_total)}, skipped_channels={skipped_channels}",
-                file=discord.File(excel_bytes, filename=filename),
-                ephemeral=True,
-            )
+            async with export_scan_lock:
+                scanned_total, added_total, skipped_channels = await scan_full_guild_history(interaction.guild)
+                last_export_scan_at[interaction.guild.id] = datetime.now(timezone.utc)
+
+                excel_bytes = build_activity_excel(interaction.guild, period="all", channel_id=None)
+                filename = (
+                    f"activity_export_all_allch_{interaction.guild_id}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+                )
+                await interaction.followup.send(
+                    "Activity report generated after incremental scan. "
+                    f"scanned={scanned_total}, added={added_total}, "
+                    f"ignored_duplicates={max(0, scanned_total - added_total)}, skipped_channels={skipped_channels}",
+                    file=discord.File(excel_bytes, filename=filename),
+                    ephemeral=True,
+                )
         except Exception:
             logger.exception("Failed slash activity export for guild=%s", interaction.guild_id)
             if interaction.response.is_done():

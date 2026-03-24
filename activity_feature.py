@@ -434,9 +434,9 @@ def register_activity_feature(
         end = min(start + inactive_page_size, total)
 
         lines = []
-        for idx, (user_id, _, last_active) in enumerate(inactive[start:end], start=start + 1):
+        for idx, (user_id, username, last_active) in enumerate(inactive[start:end], start=start + 1):
             marker = " [selected]" if selected_user_id == user_id else ""
-            lines.append(f"{idx}. <@{user_id}> | last_active={last_active}{marker}")
+            lines.append(f"{idx}. <@{user_id}> ({username}) | last_active={last_active}{marker}")
 
         embed = discord.Embed(
             title=f"Inactive Users ({period.upper()} | {channel_label})",
@@ -482,16 +482,21 @@ def register_activity_feature(
             self.page_index = safe_page
             start = safe_page * inactive_page_size
             end = min(start + inactive_page_size, len(self.inactive))
+            current_page_user_ids = {user_id for user_id, _, _ in self.inactive[start:end]}
 
             options: list[discord.SelectOption] = []
-            for user_id, username, _ in self.inactive[start:end]:
+            for user_id, username, last_active in self.inactive[start:end]:
                 options.append(
                     discord.SelectOption(
                         label=username[:100],
+                        description=f"last_active={last_active}"[:100],
                         value=str(user_id),
                         default=self.selected_user_id == user_id,
                     )
                 )
+
+            if self.selected_user_id is not None and self.selected_user_id not in current_page_user_ids:
+                self.selected_user_id = None
 
             if options:
                 self.select_user_menu.options = options

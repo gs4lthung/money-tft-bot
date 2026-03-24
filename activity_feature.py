@@ -405,8 +405,8 @@ def register_activity_feature(
                 inactive.append((member.id, str(member), "never"))
                 continue
 
-            _, _, _, total_count, last_active = activity
-            if total_count == 0:
+            _, chat_count, _, _, last_active = activity
+            if chat_count == 0:
                 inactive.append((member.id, str(member), last_active or "never"))
 
         inactive.sort(key=lambda x: x[1].lower())
@@ -485,10 +485,11 @@ def register_activity_feature(
             current_page_user_ids = {user_id for user_id, _, _ in self.inactive[start:end]}
 
             options: list[discord.SelectOption] = []
-            for user_id, username, last_active in self.inactive[start:end]:
+            for idx, (user_id, username, last_active) in enumerate(self.inactive[start:end], start=start + 1):
+                numbered_label = f"{idx}. {username}"
                 options.append(
                     discord.SelectOption(
-                        label=username[:100],
+                        label=numbered_label[:100],
                         description=f"last_active={last_active}"[:100],
                         value=str(user_id),
                         default=self.selected_user_id == user_id,

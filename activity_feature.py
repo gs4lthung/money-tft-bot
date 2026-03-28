@@ -911,8 +911,6 @@ def register_activity_feature(
             except Exception:
                 logger.exception("Failed to record chat activity for user=%s", message.author.id)
 
-        await bot.process_commands(message)
-
     @bot.listen("on_attack_event")
     async def activity_on_attack_event(guild_id: int, channel_id: int, user_id: int, username: str) -> None:
         try:

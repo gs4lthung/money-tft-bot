@@ -938,32 +938,20 @@ def register_activity_feature(
             await ctx.reply("[x] Export scan is already running. Please wait for it to finish.")
             return
 
-        now = datetime.now(timezone.utc)
-        last_run = last_export_scan_at.get(ctx.guild.id)
-        if last_run is not None:
-            elapsed = (now - last_run).total_seconds()
-            if elapsed < export_scan_cooldown_seconds:
-                wait_seconds = int(export_scan_cooldown_seconds - elapsed)
-                await ctx.reply(f"[x] Please wait {wait_seconds}s before running export again.")
-                return
-
-        await ctx.reply("Scanning channels before showing member activity list...")
-
         try:
-            async with export_scan_lock:
-                scanned_total, added_total, skipped_channels = await scan_full_guild_history(ctx.guild)
-                last_export_scan_at[ctx.guild.id] = datetime.now(timezone.utc)
+            was_bootstrapped, scanned_total, added_total, skipped_channels = await bootstrap_all_time_activity_if_needed(ctx.guild)
 
             members = get_member_activity_list(ctx.guild, period="all", channel_id=None)
             if not members:
                 await ctx.send("No members found after scan.")
                 return
 
-            await ctx.send(
-                "Scan complete. "
-                f"scanned={scanned_total}, added={added_total}, "
-                f"ignored_duplicates={max(0, scanned_total - added_total)}, skipped_channels={skipped_channels}"
-            )
+            if was_bootstrapped:
+                await ctx.send(
+                    "Initial scan complete. "
+                    f"scanned={scanned_total}, added={added_total}, "
+                    f"ignored_duplicates={max(0, scanned_total - added_total)}, skipped_channels={skipped_channels}"
+                )
 
             channel_label = "ALL CHANNELS"
             view = ActivityMembersView(
@@ -1010,24 +998,12 @@ def register_activity_feature(
             )
             return
 
-        now = datetime.now(timezone.utc)
-        last_run = last_export_scan_at.get(interaction.guild.id)
-        if last_run is not None:
-            elapsed = (now - last_run).total_seconds()
-            if elapsed < export_scan_cooldown_seconds:
-                wait_seconds = int(export_scan_cooldown_seconds - elapsed)
-                await interaction.response.send_message(
-                    f"[x] Please wait {wait_seconds}s before running export again.",
-                    ephemeral=True,
-                )
-                return
-
         try:
             await interaction.response.defer(ephemeral=True, thinking=True)
 
-            async with export_scan_lock:
-                scanned_total, added_total, skipped_channels = await scan_full_guild_history(interaction.guild)
-                last_export_scan_at[interaction.guild.id] = datetime.now(timezone.utc)
+            was_bootstrapped, scanned_total, added_total, skipped_channels = await bootstrap_all_time_activity_if_needed(
+                interaction.guild
+            )
 
             members = get_member_activity_list(interaction.guild, period="all", channel_id=None)
             if not members:
@@ -1042,10 +1018,16 @@ def register_activity_feature(
                 period="all",
                 channel_label=channel_label,
             )
+            scan_notice = ""
+            if was_bootstrapped:
+                scan_notice = (
+                    "Initial scan complete. "
+                    f"scanned={scanned_total}, added={added_total}, "
+                    f"ignored_duplicates={max(0, scanned_total - added_total)}, skipped_channels={skipped_channels}\n"
+                )
+
             await interaction.followup.send(
-                "Member activity list ready after scan. "
-                f"scanned={scanned_total}, added={added_total}, "
-                f"ignored_duplicates={max(0, scanned_total - added_total)}, skipped_channels={skipped_channels}",
+                f"{scan_notice}Member activity list ready.",
                 embed=build_member_activity_embed(
                     members,
                     0,

@@ -61,14 +61,17 @@ owner_user_id = int(owner_user_id_raw) if owner_user_id_raw.isdigit() else 0
 sync_guild_id_raw = os.getenv("DISCORD_GUILD_ID", "").strip()
 sync_guild_id = int(sync_guild_id_raw) if sync_guild_id_raw.isdigit() else None
 
-bot_prefix = os.getenv("BOT_PREFIX", "m!").strip() or "m!"
+primary_prefix = os.getenv("BOT_PREFIX", "m!").strip() or "m!"
+prefixes = ["m!"]
+if primary_prefix not in prefixes:
+    prefixes.append(primary_prefix)
 
 
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 
-bot = commands.Bot(command_prefix=commands.when_mentioned_or(bot_prefix), intents=intents, help_command=None)
+bot = commands.Bot(command_prefix=commands.when_mentioned_or(*prefixes), intents=intents, help_command=None)
 
 
 async def sync_slash_commands() -> tuple[int, str]:
@@ -104,6 +107,7 @@ async def on_ready() -> None:
         logger.exception("Slash command sync failed: %s", exc)
 
     logger.info("Logged in as %s (ID: %s)", bot.user, bot.user.id if bot.user else "unknown")
+    logger.info("Active prefix(es): %s", ", ".join(prefixes))
 
 
 @bot.event
@@ -117,9 +121,11 @@ async def on_command_error(ctx: commands.Context, error: commands.CommandError) 
 
 @bot.command(name="help")
 async def help_prefix(ctx: commands.Context) -> None:
+    prefixes_text = ", ".join(prefixes)
+    example_prefix = prefixes[0]
     await ctx.reply(
-        f"Prefix: {bot_prefix}\n"
-        f"Available commands: {bot_prefix}attack, {bot_prefix}activity_export, {bot_prefix}resync, {bot_prefix}help\n"
+        f"Prefix(es): {prefixes_text}\n"
+        f"Available commands: {example_prefix}attack, {example_prefix}activity_export, {example_prefix}resync, {example_prefix}help\n"
         "Slash commands: /attack, /activity_export"
     )
 

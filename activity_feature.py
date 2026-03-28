@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import io
 import re
+import shlex
 import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -231,6 +232,62 @@ def register_activity_feature(
             return "attack_count DESC, total_count DESC, chat_count DESC"
         return "total_count DESC, chat_count DESC, attack_count DESC"
 
+    def parse_export_date_range(
+        from_date: Optional[str],
+        to_date: Optional[str],
+    ) -> tuple[Optional[datetime], Optional[datetime]]:
+        has_from = bool((from_date or "").strip())
+        has_to = bool((to_date or "").strip())
+
+        if not has_from and not has_to:
+            return None, None
+
+        if not has_from or not has_to:
+            raise ValueError("Both from_date and to_date are required together (format: YYYY-MM-DD).")
+
+        try:
+            start_date = datetime.strptime((from_date or "").strip(), "%Y-%m-%d")
+            end_date = datetime.strptime((to_date or "").strip(), "%Y-%m-%d")
+        except ValueError as exc:
+            raise ValueError("Invalid date format. Use YYYY-MM-DD (example: 2026-03-01).") from exc
+
+        if end_date < start_date:
+            raise ValueError("to_date must be on or after from_date.")
+
+        start_at = start_date.replace(tzinfo=timezone.utc)
+        end_before = (end_date + timedelta(days=1)).replace(tzinfo=timezone.utc)
+        return start_at, end_before
+
+    def parse_activity_export_prefix_args(raw_args: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+        if raw_args is None or not raw_args.strip():
+            return None, None
+
+        tokens = shlex.split(raw_args)
+        from_date: Optional[str] = None
+        to_date: Optional[str] = None
+        i = 0
+        while i < len(tokens):
+            token = tokens[i]
+            if token in {"--from", "-f"}:
+                if i + 1 >= len(tokens):
+                    raise ValueError("Missing value after --from. Example: --from 2026-03-01")
+                from_date = tokens[i + 1]
+                i += 2
+                continue
+
+            if token in {"--to", "-t"}:
+                if i + 1 >= len(tokens):
+                    raise ValueError("Missing value after --to. Example: --to 2026-03-28")
+                to_date = tokens[i + 1]
+                i += 2
+                continue
+
+            raise ValueError(
+                "Unknown argument. Use: --from YYYY-MM-DD --to YYYY-MM-DD (or no args for normal export)."
+            )
+
+        return from_date, to_date
+
     def get_top_activity_rows(
         guild_id: int,
         limit: int,
@@ -294,9 +351,11 @@ def register_activity_feature(
         guild_id: int,
         period: str = "all",
         channel_id: Optional[int] = None,
+        start_iso: Optional[str] = None,
+        end_iso: Optional[str] = None,
     ) -> list[tuple[int, str, int, int, int, str]]:
         with sqlite3.connect(activity_db_path) as conn:
-            if period == "all" and channel_id is None:
+            if period == "all" and channel_id is None and start_iso is None and end_iso is None:
                 rows = conn.execute(
                     """
                     SELECT
@@ -312,7 +371,7 @@ def register_activity_feature(
                     (guild_id,),
                 ).fetchall()
             else:
-                start_iso = period_start_iso(period)
+                lower_bound_iso = start_iso if start_iso is not None else period_start_iso(period)
                 where_clauses = ["guild_id = ?"]
                 params: list[object] = [guild_id]
 
@@ -320,9 +379,13 @@ def register_activity_feature(
                     where_clauses.append("channel_id = ?")
                     params.append(channel_id)
 
-                if start_iso is not None:
+                if lower_bound_iso is not None:
                     where_clauses.append("created_at >= ?")
-                    params.append(start_iso)
+                    params.append(lower_bound_iso)
+
+                if end_iso is not None:
+                    where_clauses.append("created_at < ?")
+                    params.append(end_iso)
 
                 where_sql = " AND ".join(where_clauses)
                 rows = conn.execute(
@@ -388,8 +451,16 @@ def register_activity_feature(
         guild: discord.Guild,
         period: str = "all",
         channel_id: Optional[int] = None,
+        start_iso: Optional[str] = None,
+        end_iso: Optional[str] = None,
     ) -> list[tuple[int, str, int, int, int, str, str]]:
-        rows = get_activity_rows_for_export(guild.id, period=period, channel_id=channel_id)
+        rows = get_activity_rows_for_export(
+            guild.id,
+            period=period,
+            channel_id=channel_id,
+            start_iso=start_iso,
+            end_iso=end_iso,
+        )
         by_user_id: dict[int, tuple[str, int, int, int, str]] = {
             user_id: (username, chat_count, attack_count, total_count, last_active)
             for user_id, username, chat_count, attack_count, total_count, last_active in rows
@@ -762,19 +833,26 @@ def register_activity_feature(
             self.toggle_filter_button.disabled = True
             self.kick_button.disabled = True
 
-    async def scan_full_guild_history(guild: discord.Guild) -> tuple[int, int, int]:
+    async def scan_full_guild_history(
+        guild: discord.Guild,
+        start_at: Optional[datetime] = None,
+        end_before: Optional[datetime] = None,
+        use_incremental_state: bool = True,
+    ) -> tuple[int, int, int]:
         me = guild.me
         if me is None:
             return 0, 0, len(guild.text_channels)
 
-        with sqlite3.connect(activity_db_path) as conn:
-            known_scan_state = {
-                int(row[0]): int(row[1])
-                for row in conn.execute(
-                    "SELECT channel_id, last_message_id FROM channel_scan_state WHERE guild_id = ?",
-                    (guild.id,),
-                ).fetchall()
-            }
+        known_scan_state: dict[int, int] = {}
+        if use_incremental_state:
+            with sqlite3.connect(activity_db_path) as conn:
+                known_scan_state = {
+                    int(row[0]): int(row[1])
+                    for row in conn.execute(
+                        "SELECT channel_id, last_message_id FROM channel_scan_state WHERE guild_id = ?",
+                        (guild.id,),
+                    ).fetchall()
+                }
 
         scanned_total = 0
         added_total = 0
@@ -790,13 +868,18 @@ def register_activity_feature(
                 continue
 
             try:
-                previous_last_message_id = known_scan_state.get(channel.id)
+                previous_last_message_id = known_scan_state.get(channel.id) if use_incremental_state else None
                 latest_seen_message_id = previous_last_message_id or 0
                 channel_last_message_id = int(channel.last_message_id or 0)
 
                 # Fast path: if we already scanned this channel up to the current last message,
                 # skip history calls entirely.
-                if previous_last_message_id and channel_last_message_id and channel_last_message_id <= previous_last_message_id:
+                if (
+                    use_incremental_state
+                    and previous_last_message_id
+                    and channel_last_message_id
+                    and channel_last_message_id <= previous_last_message_id
+                ):
                     continue
 
                 # Fast path: empty channel, no need to call history API.
@@ -806,6 +889,11 @@ def register_activity_feature(
                 history_kwargs: dict[str, object] = {"limit": None}
                 if previous_last_message_id:
                     history_kwargs["after"] = discord.Object(id=previous_last_message_id)
+                elif start_at is not None:
+                    history_kwargs["after"] = start_at
+
+                if end_before is not None:
+                    history_kwargs["before"] = end_before
 
                 async for msg in channel.history(**history_kwargs):
                     if msg.author.bot:
@@ -836,7 +924,7 @@ def register_activity_feature(
                         await asyncio.sleep(1.0)
                         since_pause_counter = 0
 
-                if latest_seen_message_id > 0:
+                if use_incremental_state and latest_seen_message_id > 0:
                     now_iso = datetime.now(timezone.utc).isoformat()
                     with sqlite3.connect(activity_db_path) as conn:
                         conn.execute(
@@ -925,7 +1013,11 @@ def register_activity_feature(
             logger.exception("Failed to record attack activity for user=%s in guild=%s", user_id, guild_id)
 
     @bot.command(name="activity_export")
-    async def activity_export_prefix(ctx: commands.Context) -> None:
+    async def activity_export_prefix(
+        ctx: commands.Context,
+        *,
+        raw_args: Optional[str] = None,
+    ) -> None:
         if ctx.guild is None:
             await ctx.reply("[x] This command can only be used in a server.")
             return
@@ -939,21 +1031,50 @@ def register_activity_feature(
             return
 
         try:
-            was_bootstrapped, scanned_total, added_total, skipped_channels = await bootstrap_all_time_activity_if_needed(ctx.guild)
+            from_date, to_date = parse_activity_export_prefix_args(raw_args)
+            start_at, end_before = parse_export_date_range(from_date, to_date)
+        except ValueError as exc:
+            await ctx.reply(f"[x] {exc}")
+            return
 
-            members = get_member_activity_list(ctx.guild, period="all", channel_id=None)
+        try:
+            filter_start_iso: Optional[str] = None
+            filter_end_iso: Optional[str] = None
+
+            if start_at is None and end_before is None:
+                was_bootstrapped, scanned_total, added_total, skipped_channels = await bootstrap_all_time_activity_if_needed(ctx.guild)
+            else:
+                await ctx.reply(f"Scanning messages from {from_date} to {to_date}...")
+                async with export_scan_lock:
+                    scanned_total, added_total, skipped_channels = await scan_full_guild_history(
+                        ctx.guild,
+                        start_at=start_at,
+                        end_before=end_before,
+                        use_incremental_state=False,
+                    )
+                was_bootstrapped = True
+                filter_start_iso = start_at.isoformat()
+                filter_end_iso = end_before.isoformat()
+
+            members = get_member_activity_list(
+                ctx.guild,
+                period="all",
+                channel_id=None,
+                start_iso=filter_start_iso,
+                end_iso=filter_end_iso,
+            )
             if not members:
-                await ctx.send("No members found after scan.")
+                await ctx.send("No members found for the selected range.")
                 return
 
             if was_bootstrapped:
                 await ctx.send(
-                    "Initial scan complete. "
+                    "Scan complete. "
                     f"scanned={scanned_total}, added={added_total}, "
                     f"ignored_duplicates={max(0, scanned_total - added_total)}, skipped_channels={skipped_channels}"
                 )
 
-            channel_label = "ALL CHANNELS"
+            channel_label = "ALL CHANNELS" if from_date is None else f"ALL CHANNELS | {from_date}..{to_date}"
             view = ActivityMembersView(
                 author_id=ctx.author.id,
                 guild=ctx.guild,
@@ -977,8 +1098,14 @@ def register_activity_feature(
             await ctx.reply("[x] Failed to load member activity list.")
 
     @bot.tree.command(name="activity_export", description="Show member activity list with inactive toggle and kick controls")
+    @app_commands.describe(
+        from_date="Optional start date (YYYY-MM-DD). Must be used with to_date",
+        to_date="Optional end date (YYYY-MM-DD). Must be used with from_date",
+    )
     async def activity_export_slash(
         interaction: discord.Interaction,
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
     ) -> None:
         if interaction.guild is None:
             await interaction.response.send_message("[x] This command can only be used in a server.", ephemeral=True)
@@ -999,18 +1126,45 @@ def register_activity_feature(
             return
 
         try:
+            start_at, end_before = parse_export_date_range(from_date, to_date)
+        except ValueError as exc:
+            await interaction.response.send_message(f"[x] {exc}", ephemeral=True)
+            return
+
+        try:
             await interaction.response.defer(ephemeral=True, thinking=True)
 
-            was_bootstrapped, scanned_total, added_total, skipped_channels = await bootstrap_all_time_activity_if_needed(
-                interaction.guild
-            )
+            filter_start_iso: Optional[str] = None
+            filter_end_iso: Optional[str] = None
 
-            members = get_member_activity_list(interaction.guild, period="all", channel_id=None)
+            if start_at is None and end_before is None:
+                was_bootstrapped, scanned_total, added_total, skipped_channels = await bootstrap_all_time_activity_if_needed(
+                    interaction.guild
+                )
+            else:
+                async with export_scan_lock:
+                    scanned_total, added_total, skipped_channels = await scan_full_guild_history(
+                        interaction.guild,
+                        start_at=start_at,
+                        end_before=end_before,
+                        use_incremental_state=False,
+                    )
+                was_bootstrapped = True
+                filter_start_iso = start_at.isoformat()
+                filter_end_iso = end_before.isoformat()
+
+            members = get_member_activity_list(
+                interaction.guild,
+                period="all",
+                channel_id=None,
+                start_iso=filter_start_iso,
+                end_iso=filter_end_iso,
+            )
             if not members:
-                await interaction.followup.send("No members found after scan.", ephemeral=True)
+                await interaction.followup.send("No members found for the selected range.", ephemeral=True)
                 return
 
-            channel_label = "ALL CHANNELS"
+            channel_label = "ALL CHANNELS" if from_date is None else f"ALL CHANNELS | {from_date}..{to_date}"
             view = ActivityMembersView(
                 author_id=interaction.user.id,
                 guild=interaction.guild,
@@ -1021,7 +1175,7 @@ def register_activity_feature(
             scan_notice = ""
             if was_bootstrapped:
                 scan_notice = (
-                    "Initial scan complete. "
+                    "Scan complete. "
                     f"scanned={scanned_total}, added={added_total}, "
                     f"ignored_duplicates={max(0, scanned_total - added_total)}, skipped_channels={skipped_channels}\n"
                 )
